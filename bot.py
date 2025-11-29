@@ -1,10 +1,9 @@
 import ccxt
 import time
 import telegram  # pip install python-telegram-bot
-from telegram.ext import Application
 import os
 
-# API 키 환경 변수로만 읽기 (하드코딩 금지)
+# API 키 환경 변수로만 읽기
 try:
     BINANCE_API = os.environ['BINANCE_API_KEY']
     BINANCE_SECRET = os.environ['BINANCE_SECRET']
@@ -21,7 +20,7 @@ try:
 except KeyError as e:
     raise ValueError(f"환경 변수 누락: {e}")
 
-# 거래소 연결 (각각 try로 안전하게)
+# 거래소 연결
 exchanges = {}
 try:
     exchanges['binance'] = ccxt.binance({'apiKey': BINANCE_API, 'secret': BINANCE_SECRET})
@@ -48,11 +47,11 @@ try:
 except Exception as e:
     print(f"OKX 연결 오류: {e}")
 
-app = Application.builder().token(TELEGRAM_TOKEN).build()
+bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
 def send_telegram(message):
     try:
-        app.bot.send_message(chat_id=CHAT_ID, text=message)
+        bot.send_message(chat_id=CHAT_ID, text=message)
     except Exception as e:
         print(f"텔레그램 알림 오류: {e}")
 
@@ -94,6 +93,4 @@ while True:
         send_telegram(f"봇 재시작: {e}")
         time.sleep(10)  # 안전 재시작 딜레이
 
-if __name__ == '__main__':
-    send_telegram("까망빠나나 시작! Railway 도쿄에서 24/7 실행 중.")
-    # 루프 실행
+send_telegram("까망빠나나 시작! Railway 도쿄에서 24/7 실행 중.")
