@@ -2,6 +2,7 @@ import ccxt
 import time
 import telegram  # pip install python-telegram-bot
 import os
+import asyncio
 
 # API 키 환경 변수로만 읽기
 try:
@@ -49,48 +50,51 @@ except Exception as e:
 
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
-def send_telegram(message):
+async def send_telegram(message):
     try:
-        bot.send_message(chat_id=CHAT_ID, text=message)
+        await bot.send_message(chat_id=CHAT_ID, text=message)
     except Exception as e:
         print(f"텔레그램 알림 오류: {e}")
 
-def get_exchange_rate(base_ex='binance'):
+async def get_exchange_rate(base_ex='binance'):
     try:
         usd_krw = exchanges[base_ex].fetch_ticker('USDT/KRW')['bid']
         return usd_krw
     except Exception as e:
-        send_telegram(f"환율 오류: {e}")
+        await send_telegram(f"환율 오류: {e}")
         return 1350
 
-def get_spread(base_ex = 'binance', target_ex = 'upbit', pair = 'BTC/USDT', krw_pair = 'BTC/KRW'):
+async def get_spread(base_ex = 'binance', target_ex = 'upbit', pair = 'BTC/USDT', krw_pair = 'BTC/KRW'):
     try:
         btc_base = exchanges[base_ex].fetch_ticker(pair)['bid']
-        btc_target = exchanges[target_ex].fetch_ticker(krw_pair)['ask'] / get_exchange_rate()
+        btc_target = exchanges[target_ex].fetch_ticker(krw_pair)['ask'] / await get_exchange_rate()
         spread = (btc_target / btc_base - 1) * 100
         return spread
     except Exception as e:
-        send_telegram(f"{target_ex} Spread 오류: {e}")
+        await send_telegram(f"{target_ex} Spread 오류: {e}")
         return 0
 
 # 메인 루프 (풀세트 자동, 안전 모드)
-while True:
-    try:
-        spreads = {}
-        for target in ['upbit', 'bithumb', 'bybit', 'okx']:
-            spreads[target] = get_spread('binance', target)
-        
-        max_spread_ex = max(spreads, key=spreads.get)
-        spread = spreads[max_spread_ex]
-        if spread > 2.5:
-            amount = 0.001  # 최대 0.001 BTC (약 200만 원, 안전 제한)
-            exchanges['binance'].create_market_buy_order('BTC/USDT', amount)
-            exchanges[max_spread_ex].create_market_sell_order('BTC/KRW', 1350 * amount * (btc_base + 0.01 * btc_base))
-            profit = spread * amount * 20000
-            send_telegram(f"Arbitrage 실행! {max_spread_ex} Spread {spread:.2f}% - 예상 수익 +{profit:.0f}원")
-        time.sleep(60)
-    except Exception as e:
-        send_telegram(f"봇 재시작: {e}")
-        time.sleep(10)  # 안전 재시작 딜레이
+async def main():
+    await send_telegram("까망빠나나 시작! Railway 도쿄에서 24/7 실행 중.")
+    while True:
+        try:
+            spreads = {}
+            for target in ['upbit', 'bithumb', 'bybit', 'okx']:
+                spreads[target] = await get_spread('binance', target)
+            
+            max_spread_ex = max(spreads, key=spreads.get)
+            spread = spreads[max_spread_ex]
+            if spread > 2.5:
+                amount = 0.001  # 최대 0.001 BTC (약 200만 원, 안전 제한)
+                exchanges['binance'].create_market_buy_order('BTC/USDT', amount)
+                exchanges[max_spread_ex].create_market_sell_order('BTC/KRW', (await get_exchange_rate()) * amount * (btc_base + 0.01 * btc_base))
+                profit = spread * amount * 20000
+                await send_telegram(f"Arbitrage 실행! {max_spread_ex} Spread {spread:.2f}% - 예상 수익 +{profit:.0f}원")
+            await asyncio.sleep(60)
+        except Exception as e:
+            await send_telegram(f"봇 재시작: {e}")
+            await asyncio.sleep(10)  # 안전 재시작 딜레이
 
-send_telegram("까망빠나나 시작! Railway 도쿄에서 24/7 실행 중.")
+if __name__ == '__main__':
+    asyncio.run(main())
