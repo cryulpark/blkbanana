@@ -20,7 +20,7 @@ CHAT_ID = 'YOUR_CHAT_ID'
 # 거래소 연결
 exchanges = {
     'binance': ccxt.binance({'apiKey': BINANCE_API, 'secret': BINANCE_SECRET}),
-    'upbit': ccxt.upbit({'apiKey': UPBIT_API, 'secret': UPBIT_SECRET}),
+    'upbit': ccxt.upbit({'apiKey': P5Z7vxjkM4XNlvrb7VAdfMmgo5usBz30cxAMikDH, 'secret': FcDJdwrNLL4HFg5ZI5Sx3ZAIyOKxvJYe7xXOGCh4}),
     'bithumb': ccxt.bithumb({'apiKey': BITHUMB_API, 'secret': BITHUMB_SECRET}),
     'bybit': ccxt.bybit({'apiKey': BYBIT_API, 'secret': BYBIT_SECRET}),
     'okx': ccxt.okx({'apiKey': OKX_API, 'secret': OKX_SECRET}),
