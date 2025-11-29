@@ -69,6 +69,7 @@ async def get_spread(base_ex = 'binance', target_ex = 'upbit', pair = 'BTC/USDT'
         btc_base = exchanges[base_ex].fetch_ticker(pair)['bid']
         btc_target = exchanges[target_ex].fetch_ticker(krw_pair)['ask'] / await get_exchange_rate()
         spread = (btc_target / btc_base - 1) * 100
+        print(f"{target_ex} Spread: {spread:.2f}%")  # 로그 출력 추가
         return spread
     except Exception as e:
         await send_telegram(f"{target_ex} Spread 오류: {e}")
@@ -91,6 +92,7 @@ async def main():
                 exchanges[max_spread_ex].create_market_sell_order('BTC/KRW', (await get_exchange_rate()) * amount * (btc_base + 0.01 * btc_base))
                 profit = spread * amount * 20000
                 await send_telegram(f"Arbitrage 실행! {max_spread_ex} Spread {spread:.2f}% - 예상 수익 +{profit:.0f}원")
+            print("봇 루프 실행 중...")  # 로그 출력 추가 (돌아가는지 확인용)
             await asyncio.sleep(60)
         except Exception as e:
             await send_telegram(f"봇 재시작: {e}")
