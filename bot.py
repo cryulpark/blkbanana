@@ -77,7 +77,7 @@ async def get_funding_rate(pair='BTC/USDT'):
     except:
         return 0
 
-async def get_triangular_spread(ex_name, pair1, pair2, pair3):
+async def get_triangular_spread(ex_name, pair1='BTC/USDT', pair2='ETH/USDT', pair3='BTC/ETH'):
     try:
         price1 = exchanges[ex_name].fetch_ticker(pair1)['bid']
         price2 = exchanges[ex_name].fetch_ticker(pair2)['bid']
@@ -85,10 +85,10 @@ async def get_triangular_spread(ex_name, pair1, pair2, pair3):
         loop = price1 / (price2 * price3) - 1
         return loop * 100
     except Exception as e:
-        await send_telegram(f"{ex_name} Triangular 오류: {e}")
+        await send_telegram(f"{ex_name} 삼각 오류: {e}")
         return 0
 
-# 메인 루프 (풀세트 자동, 안전 모드, BTC + ETH + OKX/Bybit 삼각 추가)
+# 메인 루프 (풀세트 자동, 안전 모드)
 async def main():
     await send_telegram("까망빠나나 시작! Railway 도쿄에서 24/7 실행 중.")
     last_status_time = time.time()
