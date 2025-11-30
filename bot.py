@@ -4,7 +4,8 @@ import traceback
 from typing import Dict, Any, Tuple, List
 
 import ccxt
-from telegram import Bot  # python-telegram-bot==20.7
+from ccxt.base.errors import AuthenticationError
+import requests
 
 
 # ==============================
@@ -78,7 +79,6 @@ CHAT_ID = load_env("CHAT_ID")
 # ==============================
 
 exchanges: Dict[str, ccxt.Exchange] = {}
-bot = Bot(token=TELEGRAM_TOKEN)
 
 cumulative_profit_krw: float = 0.0
 last_status_time: float = time.time()
@@ -127,22 +127,17 @@ def init_exchanges() -> None:
 
 def send_telegram(message: str) -> None:
     """
-    python-telegram-bot 20.x -> Bot.send_message는 async.
-    여기서는 매번 asyncio.run으로 한 번씩 실행.
+    텔레그램 메시지를 HTTP API로 직접 전송 (동기).
+    python-telegram-bot의 이벤트 루프 문제를 피하기 위해 requests 사용.
     """
-    import asyncio
-
-    async def _send():
-        try:
-            await bot.send_message(chat_id=CHAT_ID, text=message)
-        except Exception as e:
-            print(f"[TELEGRAM] 전송 오류: {e}")
-
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": message}
     try:
-        asyncio.run(_send())
-    except RuntimeError:
-        # 이미 다른 이벤트 루프가 돌고 있는 특수 환경 대비
-        print("[TELEGRAM] asyncio 루프 충돌 – 메시지 전송 스킵")
+        resp = requests.post(url, data=data, timeout=10)
+        if not resp.ok:
+            print(f"[TELEGRAM] 응답 오류: {resp.status_code} {resp.text}")
+    except Exception as e:
+        print(f"[TELEGRAM] 전송 예외: {e}")
 
 
 def now_ts() -> float:
@@ -348,7 +343,17 @@ def run_spot_arbitrage(symbol: str, threshold: float) -> None:
                 f"(threshold={threshold:.2f}%)"
             )
 
-            balance_krw_ex = ex.fetch_balance()
+            # KRW 거래소 잔고
+            try:
+                balance_krw_ex = ex.fetch_balance()
+            except AuthenticationError as ae:
+                # 업비트 키가 틀리거나 권한 문제일 때 여기서 잡힘
+                print(f"[ARBITRAGE] {venue} 잔고 조회 인증 오류: {ae} – 이 거래소는 스킵합니다.")
+                continue
+            except Exception as e:
+                print(f"[ARBITRAGE] {venue} 잔고 조회 실패: {e}")
+                continue
+
             ex_free_krw = get_free(balance_krw_ex, "KRW")
             ex_free_symbol = get_free(balance_krw_ex, symbol)
 
@@ -582,12 +587,10 @@ def monitor_funding() -> None:
 def send_daily_report_if_needed() -> None:
     """
     매일 아침 9시에 지난 24시간 수익/손실을 분야별로 텔레그램 리포트.
-    - 기준 타임존은 컨테이너 로컬타임(대부분 UTC지만, 한국 서버면 KST).
-      실제 환경에서 필요하면 타임존 보정 추가 가능.
+    기준 시간: 컨테이너 로컬타임.
     """
     global last_daily_report_date
 
-    # 현재 로컬 시간
     lt = time.localtime()
     current_date = f"{lt.tm_year:04d}-{lt.tm_mon:02d}-{lt.tm_mday:02d}"
 
@@ -600,7 +603,6 @@ def send_daily_report_if_needed() -> None:
     now = now_ts()
     cutoff = now - 86400  # 최근 24시간
 
-    # 24시간 이내 트레이드 필터링
     recent_trades = [t for t in TRADE_LOG if t["ts"] >= cutoff]
 
     if not recent_trades:
@@ -655,7 +657,6 @@ def send_daily_report_if_needed() -> None:
     print(msg)
     send_telegram(msg)
 
-    # 오늘 리포트 발송 완료 표시
     last_daily_report_date = current_date
 
 
