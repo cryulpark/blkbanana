@@ -103,7 +103,7 @@ def init_exchanges() -> None:
     config = [
         ("binance", ccxt.binance, BINANCE_API, BINANCE_SECRET, {"enableRateLimit": True}),
         ("upbit",   ccxt.upbit,   UPBIT_API,   UPBIT_SECRET,   {"enableRateLimit": True}),
-        ("bithumb", ccxt.bithumb, BITHUMB_API, BITHUMB_SECRET, {"enableRateLimit": True}),
+        ("bithumb", ccxt.bithumbglobal, BITHUMB_API, BITHUMB_SECRET, {"enableRateLimit": True}),
         ("bybit",   ccxt.bybit,   BYBIT_API,   BYBIT_SECRET,   {"enableRateLimit": True}),
         ("okx",     ccxt.okx,     OKX_API,     OKX_SECRET,     {"enableRateLimit": True}),
     ]
