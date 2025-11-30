@@ -1,6 +1,5 @@
 import os
 import time
-import math
 import traceback
 from typing import Dict, Any, Tuple
 
@@ -12,34 +11,34 @@ from telegram import Bot  # python-telegram-bot==20.7
 # 1. 설정값
 # ==============================
 
-# 실매매 여부 (True = 실제 주문, False = 드라이런 / 시뮬레이션)
+# 실매매 여부 (True = 실제 주문, False = 시뮬레이션)
 DRY_RUN = True
 
 # 기본 루프 주기(초)
-MAIN_LOOP_INTERVAL = 60  # 1분마다 체크
+MAIN_LOOP_INTERVAL = 60  # 1분
 
 # 상태 보고 주기(초)
-STATUS_INTERVAL = 3600  # 1시간마다 텔레그램 보고
+STATUS_INTERVAL = 3600  # 1시간
 
-# 재정거래 진입 기본 스프레드 기준 (%)
-LOW_VOL_THRESHOLD = 2.5
-HIGH_VOL_THRESHOLD = 2.0
-VOL_THRESHOLD_BORDER = 10.0  # 변동성 10% 기준으로 high/low 구분
+# 재정거래 진입 스프레드 기준 (%)
+LOW_VOL_THRESHOLD = 2.5   # 일간 변동성 10% 미만
+HIGH_VOL_THRESHOLD = 2.0  # 일간 변동성 10% 이상
+VOL_THRESHOLD_BORDER = 10.0  # 변동성 10% 기준
 
-# 각 전략별 최소 스프레드 / 펀딩 기준
-MIN_TRIANGULAR_SPREAD = 0.5   # 삼각 차익 최소 스프레드 (%)
-MIN_FUNDING_RATE = 0.01       # 펀딩비 1% 이상 시 알림
+# 삼각 차익, 펀딩비 기준
+MIN_TRIANGULAR_SPREAD = 0.5   # %
+MIN_FUNDING_RATE = 0.01       # 1%
 
-# 각 코인별 1회 주문 수량 (예시)
+# 1회 주문 수량 (예시)
 BTC_AMOUNT = 0.001
 ETH_AMOUNT = 0.01
 
-# 같은 전략으로 연속 진입을 막기 위한 쿨다운(초)
+# 전략별 쿨다운(초) – 동일 전략/심볼/거래소 기준
 ARBITRAGE_COOLDOWN = 300  # 5분
 
 
 # ==============================
-# 2. 환경 변수 로딩
+# 2. 환경 변수
 # ==============================
 
 def load_env(key: str) -> str:
@@ -52,7 +51,7 @@ def load_env(key: str) -> str:
 BINANCE_API = load_env("BINANCE_API_KEY")
 BINANCE_SECRET = load_env("BINANCE_SECRET")
 
-# 바이낸스 선물(USDT-M)용 키 (없으면 spot 키 재사용)
+# 선물(USDT-M)용 별도 키 (없으면 spot 키 재사용)
 BINANCE_FUTURES_API = os.environ.get("BINANCE_FUTURES_API_KEY", BINANCE_API)
 BINANCE_FUTURES_SECRET = os.environ.get("BINANCE_FUTURES_SECRET", BINANCE_SECRET)
 
@@ -82,8 +81,8 @@ bot = Bot(token=TELEGRAM_TOKEN)
 cumulative_profit_krw: float = 0.0
 last_status_time: float = time.time()
 
-# 최근 전략 실행 시간 기록용 (중복 진입 방지)
-last_trade_times: Dict[Tuple[str, str, str], float] = {}  # (strategy, symbol, venue)
+# (strategy, symbol, venue) -> 최근 실행 시각
+last_trade_times: Dict[Tuple[str, str, str], float] = {}
 
 
 # ==============================
@@ -93,19 +92,19 @@ last_trade_times: Dict[Tuple[str, str, str], float] = {}  # (strategy, symbol, v
 def init_exchanges() -> None:
     """
     ccxt 거래소 인스턴스 초기화.
-    - binance: 현물
-    - binance_futures: USDT-M 선물
-    - upbit, bithumb, bybit, okx: 현물
+    - binance: spot
+    - binance_futures: USDT-M futures
+    - upbit, bithumb, bybit, okx: spot
     """
     global exchanges
 
     config = [
-        ("binance",         ccxt.binance,     BINANCE_API,          BINANCE_SECRET,          {"enableRateLimit": True}),
-        ("binance_futures", ccxt.binanceusdm, BINANCE_FUTURES_API,  BINANCE_FUTURES_SECRET, {"enableRateLimit": True}),
-        ("upbit",           ccxt.upbit,       UPBIT_API,            UPBIT_SECRET,            {"enableRateLimit": True}),
-        ("bithumb",         ccxt.bithumb,     BITHUMB_API,          BITHUMB_SECRET,          {"enableRateLimit": True}),
-        ("bybit",           ccxt.bybit,       BYBIT_API,            BYBIT_SECRET,            {"enableRateLimit": True}),
-        ("okx",             ccxt.okx,         OKX_API,              OKX_SECRET,              {"enableRateLimit": True}),
+        ("binance",         ccxt.binance,     BINANCE_API,         BINANCE_SECRET,         {"enableRateLimit": True}),
+        ("binance_futures", ccxt.binanceusdm, BINANCE_FUTURES_API, BINANCE_FUTURES_SECRET, {"enableRateLimit": True}),
+        ("upbit",           ccxt.upbit,       UPBIT_API,           UPBIT_SECRET,           {"enableRateLimit": True}),
+        ("bithumb",         ccxt.bithumb,     BITHUMB_API,         BITHUMB_SECRET,         {"enableRateLimit": True}),
+        ("bybit",           ccxt.bybit,       BYBIT_API,           BYBIT_SECRET,           {"enableRateLimit": True}),
+        ("okx",             ccxt.okx,         OKX_API,             OKX_SECRET,             {"enableRateLimit": True}),
     ]
 
     for name, cls, api, secret, params in config:
@@ -120,8 +119,8 @@ def init_exchanges() -> None:
 
 def send_telegram(message: str) -> None:
     """
-    python-telegram-bot 20.x 기준 Bot 메서드는 async이므로,
-    asyncio.run으로 한 번씩 실행 (메인 루프는 동기).
+    python-telegram-bot 20.x -> Bot.send_message는 async.
+    여기서는 매번 asyncio.run으로 한 번씩 실행.
     """
     import asyncio
 
@@ -134,8 +133,7 @@ def send_telegram(message: str) -> None:
     try:
         asyncio.run(_send())
     except RuntimeError:
-        # 혹시 이미 이벤트 루프가 도는 환경이라면 (일반 Railway에서는 거의 없음)
-        # 그냥 에러만 찍고 넘어간다.
+        # 이미 다른 이벤트 루프가 돌고 있는 특수 환경 대비 (일반 Railway에서는 거의 없음)
         print("[TELEGRAM] asyncio 루프 충돌 – 메시지 전송 스킵")
 
 
@@ -156,11 +154,13 @@ def touch_trade_time(strategy: str, symbol: str, venue: str) -> None:
 
 def safe_fetch_ticker(ex: ccxt.Exchange, symbol: str) -> Dict[str, Any]:
     """
-    ticker를 안전하게 가져오는 래퍼. bid/ask 없으면 예외 발생.
+    ticker를 안전하게 가져오는 래퍼. bid/ask 없거나 None이면 예외 발생.
     """
     ticker = ex.fetch_ticker(symbol)
-    if "bid" not in ticker or "ask" not in ticker:
-        raise RuntimeError(f"ticker 데이터에 bid/ask 없음: {ex.id} {symbol} {ticker}")
+    bid = ticker.get("bid")
+    ask = ticker.get("ask")
+    if bid is None or ask is None:
+        raise RuntimeError(f"ticker에 bid/ask 값이 없음: {ex.id} {symbol} {ticker}")
     return ticker
 
 
@@ -178,13 +178,14 @@ def get_usdt_krw_rate() -> float:
             return float(t["bid"])
         except Exception as e:
             print(f"[FX] {name} USDT/KRW 조회 실패: {e}")
+
     print("[FX] 환율 조회 실패 – 기본값 1350 사용")
     return 1350.0
 
 
 def get_daily_volatility() -> float:
     """
-    바이낸스 현물 BTC/USDT 일간 변동성(%) 계산.
+    바이낸스 현물 BTC/USDT 일간 변동성(%).
     """
     try:
         ex = exchanges["binance"]
@@ -201,24 +202,23 @@ def get_daily_volatility() -> float:
 
 def get_binance_spot_price(symbol: str) -> float:
     """
-    바이낸스 현물 기준가 (bid) USDT.
+    바이낸스 현물 기준가 (bid, USDT).
     symbol: 'BTC' / 'ETH'
     """
     ex = exchanges["binance"]
-    base_pair = f"{symbol}/USDT"
-    t = safe_fetch_ticker(ex, base_pair)
+    pair = f"{symbol}/USDT"
+    t = safe_fetch_ticker(ex, pair)
     return float(t["bid"])
 
 
 def get_krw_spread(symbol: str, usdt_krw: float) -> Dict[str, Dict[str, float]]:
     """
-    업비트 및 빗썸의 KRW 마켓을 기준으로
-    바이낸스 현물(USDT) 대비 스프레드(%) 계산.
+    업비트/빗썸 KRW 마켓 vs 바이낸스 현물(USDT) 스프레드 계산.
 
-    반환 형식:
+    반환:
     {
-      "upbit":  {"spread": float, "ask_krw": float},
-      "bithumb":{"spread": float, "ask_krw": float},
+      "upbit":  {"spread": float, "ask_krw": float, "base_price_usdt": float},
+      "bithumb":{"spread": float, "ask_krw": float, "base_price_usdt": float},
     }
     """
     result: Dict[str, Dict[str, float]] = {}
@@ -248,7 +248,6 @@ def get_krw_spread(symbol: str, usdt_krw: float) -> Dict[str, Dict[str, float]]:
 def est_profit_krw(spread_pct: float, base_price_usdt: float, amount: float, usdt_krw: float) -> float:
     """
     단순 추정 수익(수수료/슬리피지 미반영).
-    spread_pct: 스프레드(%)
     """
     profit_usdt = (spread_pct / 100.0) * base_price_usdt * amount
     return profit_usdt * usdt_krw
@@ -342,9 +341,17 @@ def run_spot_arbitrage(symbol: str, amount: float, threshold: float) -> None:
 
 def run_triangular_arb(ex_name: str) -> None:
     """
-    Bybit/OKX 삼각 차익 모니터링 및 (옵션) 소량 테스트 주문.
-    DRY_RUN=True 상태에서 테스트 권장.
+    Bybit/OKX 삼각 차익 모니터링 + (DRY_RUN 모의 주문).
+    루프: USDT -> BTC -> ETH -> USDT
     """
+
+    def pick_symbol(ex: ccxt.Exchange, candidates):
+        """여러 후보 중 실제 존재하는 심볼 하나 선택."""
+        for s in candidates:
+            if s in ex.markets:
+                return s
+        raise RuntimeError(f"{ex.id}에서 사용 가능한 심볼이 없음: {candidates}")
+
     strategy_name = "triangular"
     symbol = "BTC-ETH"
     ex = exchanges.get(ex_name)
@@ -352,16 +359,25 @@ def run_triangular_arb(ex_name: str) -> None:
         return
 
     try:
-        # BTC/USDT, ETH/USDT, BTC/ETH 세 마켓이 있다고 가정
-        t_btc_usdt = safe_fetch_ticker(ex, "BTC/USDT")
-        t_eth_usdt = safe_fetch_ticker(ex, "ETH/USDT")
-        t_btc_eth = safe_fetch_ticker(ex, "BTC/ETH")
+        # 심볼 자동 선택 (spot, 또는 :USDT 선물 등)
+        btc_usdt_sym = pick_symbol(ex, ["BTC/USDT", "BTC/USDT:USDT"])
+        eth_usdt_sym = pick_symbol(ex, ["ETH/USDT", "ETH/USDT:USDT"])
+        eth_btc_sym = pick_symbol(ex, ["ETH/BTC"])
 
-        p_btc_usdt = float(t_btc_usdt["bid"])
-        p_eth_usdt = float(t_eth_usdt["bid"])
-        p_btc_eth = float(t_btc_eth["bid"])
+        t_btc_usdt = safe_fetch_ticker(ex, btc_usdt_sym)
+        t_eth_usdt = safe_fetch_ticker(ex, eth_usdt_sym)
+        t_eth_btc = safe_fetch_ticker(ex, eth_btc_sym)
 
-        loop_val = p_btc_usdt / (p_eth_usdt * p_btc_eth) - 1.0
+        p_btc_usdt = float(t_btc_usdt["bid"])  # 1 BTC = ? USDT
+        p_eth_usdt = float(t_eth_usdt["bid"])  # 1 ETH = ? USDT
+        p_eth_btc = float(t_eth_btc["bid"])    # 1 ETH = ? BTC
+
+        # 루프: 1 USDT -> BTC -> ETH -> USDT
+        # USDT -> BTC      : BTC1 = 1 / p_btc_usdt
+        # BTC -> ETH(ETH/BTC): ETH1 = BTC1 / p_eth_btc
+        # ETH -> USDT      : USDT2 = ETH1 * p_eth_usdt
+        # => USDT2 = p_eth_usdt / (p_btc_usdt * p_eth_btc)
+        loop_val = p_eth_usdt / (p_btc_usdt * p_eth_btc) - 1.0
         spread_pct = loop_val * 100.0
 
         print(f"[TRIANGULAR] {ex_name} spread={spread_pct:.4f}%")
@@ -377,17 +393,19 @@ def run_triangular_arb(ex_name: str) -> None:
         msg = (
             f"[TRIANGULAR] {ex_name.upper()} 삼각 차익 기회 감지\n"
             f"- 스프레드: {spread_pct:.4f}%\n"
-            f"- p(BTC/USDT)={p_btc_usdt}, p(ETH/USDT)={p_eth_usdt}, p(BTC/ETH)={p_btc_eth}\n"
-            f"- DRY_RUN: {DRY_RUN} (실매매는 매우 위험, 충분한 테스트 필요)\n"
+            f"- {btc_usdt_sym} bid={p_btc_usdt}, {eth_usdt_sym} bid={p_eth_usdt}, {eth_btc_sym} bid={p_eth_btc}\n"
+            f"- DRY_RUN: {DRY_RUN} (실매매는 충분한 테스트 후 권장)\n"
         )
 
-        # 예시: DRY_RUN 모드에서 소량 루프 흉내
-        amount_eth = 0.01
+        # DRY_RUN 모드에서 소량 루프 흉내
+        amount_usdt = 10.0
+        btc_amount = amount_usdt / p_btc_usdt
+        eth_amount = btc_amount / p_eth_btc
+
         try:
-            create_market_order(ex, "ETH/USDT", "buy", amount_eth)
-            # 단순 비율 – 실제로는 훨씬 정교한 루프가 필요
-            btc_amount = amount_eth * (p_eth_usdt / p_btc_usdt)
-            create_market_order(ex, "BTC/ETH", "sell", btc_amount)
+            create_market_order(ex, btc_usdt_sym, "buy", btc_amount)   # USDT -> BTC
+            create_market_order(ex, eth_btc_sym, "buy", eth_amount)    # BTC -> ETH (ETH/BTC 기준 buy)
+            create_market_order(ex, eth_usdt_sym, "sell", eth_amount)  # ETH -> USDT
         except Exception as oe:
             msg += f"- 모의 주문 중 오류: {oe}\n"
 
@@ -405,19 +423,30 @@ def run_triangular_arb(ex_name: str) -> None:
 def monitor_funding() -> None:
     """
     바이낸스 USDT-M 선물 BTC/USDT 펀딩비 모니터링.
-    현재는 알림만, 자동 포지션 진입은 없음.
+    현재는 알림만, 자동 포지션 진입 없음.
     """
     try:
         ex = exchanges["binance_futures"]
-        fr = ex.fetch_funding_rate("BTC/USDT")
+
+        # 선물 심볼 자동 선택
+        symbol_candidates = ["BTC/USDT:USDT", "BTC/USDT"]
+        symbol = None
+        for s in symbol_candidates:
+            if s in ex.markets:
+                symbol = s
+                break
+        if symbol is None:
+            raise RuntimeError("Binance USDM에서 BTC/USDT 선물 심볼을 찾을 수 없음")
+
+        fr = ex.fetch_funding_rate(symbol)
         rate = float(fr.get("rate", 0.0))
 
-        print(f"[FUNDING] BTC/USDT rate={rate:.6f}")
+        print(f"[FUNDING] {symbol} rate={rate:.6f}")
 
         if rate >= MIN_FUNDING_RATE:
             msg = (
                 f"[FUNDING] 펀딩비 기회 감지\n"
-                f"- Binance Futures BTC/USDT funding rate: {rate:.6f}\n"
+                f"- {symbol} funding rate: {rate:.6f}\n"
                 f"- 현재 코드는 알림만 보내고 자동 포지션은 진입하지 않습니다.\n"
             )
             print(msg)
