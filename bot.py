@@ -26,9 +26,8 @@ LOW_VOL_THRESHOLD = 2.5   # 일간 변동성 10% 미만
 HIGH_VOL_THRESHOLD = 2.0  # 일간 변동성 10% 이상
 VOL_THRESHOLD_BORDER = 10.0  # 변동성 10% 기준
 
-# 삼각 차익, 펀딩비 기준
+# 삼각 차익 기준 (스프레드 %)
 MIN_TRIANGULAR_SPREAD = 0.5   # %
-MIN_FUNDING_RATE = 0.01       # 1%
 
 # 거래 시 잔고에서 사용하는 비율 (예: 0.5면 잔고의 50%까지 사용)
 USE_BALANCE_RATIO = 0.5
@@ -53,10 +52,6 @@ def load_env(key: str) -> str:
 
 BINANCE_API = load_env("BINANCE_API_KEY")
 BINANCE_SECRET = load_env("BINANCE_SECRET")
-
-# 선물(USDT-M)용 별도 키 (없으면 spot 키 재사용)
-BINANCE_FUTURES_API = os.environ.get("BINANCE_FUTURES_API_KEY", BINANCE_API)
-BINANCE_FUTURES_SECRET = os.environ.get("BINANCE_FUTURES_SECRET", BINANCE_SECRET)
 
 UPBIT_API = load_env("UPBIT_API_KEY")
 UPBIT_SECRET = load_env("UPBIT_SECRET")
@@ -101,18 +96,16 @@ def init_exchanges() -> None:
     """
     ccxt 거래소 인스턴스 초기화.
     - binance: spot
-    - binance_futures: USDT-M futures
     - upbit, bithumb, bybit, okx: spot
     """
     global exchanges
 
     config = [
-        ("binance",         ccxt.binance,     BINANCE_API,         BINANCE_SECRET,         {"enableRateLimit": True}),
-        ("binance_futures", ccxt.binanceusdm, BINANCE_FUTURES_API, BINANCE_FUTURES_SECRET, {"enableRateLimit": True}),
-        ("upbit",           ccxt.upbit,       UPBIT_API,           UPBIT_SECRET,           {"enableRateLimit": True}),
-        ("bithumb",         ccxt.bithumb,     BITHUMB_API,         BITHUMB_SECRET,         {"enableRateLimit": True}),
-        ("bybit",           ccxt.bybit,       BYBIT_API,           BYBIT_SECRET,           {"enableRateLimit": True}),
-        ("okx",             ccxt.okx,         OKX_API,             OKX_SECRET,             {"enableRateLimit": True}),
+        ("binance", ccxt.binance, BINANCE_API, BINANCE_SECRET, {"enableRateLimit": True}),
+        ("upbit",   ccxt.upbit,   UPBIT_API,   UPBIT_SECRET,   {"enableRateLimit": True}),
+        ("bithumb", ccxt.bithumb, BITHUMB_API, BITHUMB_SECRET, {"enableRateLimit": True}),
+        ("bybit",   ccxt.bybit,   BYBIT_API,   BYBIT_SECRET,   {"enableRateLimit": True}),
+        ("okx",     ccxt.okx,     OKX_API,     OKX_SECRET,     {"enableRateLimit": True}),
     ]
 
     for name, cls, api, secret, params in config:
@@ -258,10 +251,6 @@ def get_free(balance: Dict[str, Any], currency: str) -> float:
 def log_trade(strategy: str, symbol: str, venue: str, direction: str, profit_krw: float) -> None:
     """
     트레이드 로그에 기록 (24시간 리포트용).
-    strategy 예) "spot_arb", "triangular", ...
-    symbol 예) "BTC", "ETH"
-    venue  예) "upbit", "bithumb", ...
-    direction 예) "KRW_sell", "KRW_buy"
     """
     TRADE_LOG.append(
         {
@@ -347,7 +336,6 @@ def run_spot_arbitrage(symbol: str, threshold: float) -> None:
             try:
                 balance_krw_ex = ex.fetch_balance()
             except AuthenticationError as ae:
-                # 업비트 키가 틀리거나 권한 문제일 때 여기서 잡힘
                 print(f"[ARBITRAGE] {venue} 잔고 조회 인증 오류: {ae} – 이 거래소는 스킵합니다.")
                 continue
             except Exception as e:
@@ -463,7 +451,7 @@ def est_profit_krw(spread_pct: float, base_price_usdt: float, amount: float, usd
 
 
 # ==============================
-# 6. 삼각 차익 / 펀딩 (알림 위주, DRY_RUN 모의)
+# 6. 삼각 차익 (Bybit/OKX, DRY_RUN 모의)
 # ==============================
 
 def run_triangular_arb(ex_name: str) -> None:
@@ -540,44 +528,6 @@ def run_triangular_arb(ex_name: str) -> None:
         tb = traceback.format_exc()
         print(f"[TRIANGULAR] {ex_name} 오류: {e}\n{tb}")
         send_telegram(f"[TRIANGULAR] {ex_name} 오류: {e}")
-
-
-def monitor_funding() -> None:
-    """
-    바이낸스 USDT-M 선물 BTC/USDT 펀딩비 모니터링.
-    현재는 알림만, 자동 포지션 진입 없음.
-    """
-    try:
-        ex = exchanges["binance_futures"]
-
-        # 선물 심볼 자동 선택
-        symbol_candidates = ["BTC/USDT:USDT", "BTC/USDT"]
-        symbol = None
-        for s in symbol_candidates:
-            if s in ex.markets:
-                symbol = s
-                break
-        if symbol is None:
-            raise RuntimeError("Binance USDM에서 BTC/USDT 선물 심볼을 찾을 수 없음")
-
-        fr = ex.fetch_funding_rate(symbol)
-        rate = float(fr.get("rate", 0.0))
-
-        print(f"[FUNDING] {symbol} rate={rate:.6f}")
-
-        if rate >= MIN_FUNDING_RATE:
-            msg = (
-                f"[FUNDING] 펀딩비 기회 감지\n"
-                f"- {symbol} funding rate: {rate:.6f}\n"
-                f"- 현재 코드는 알림만 보내고 자동 포지션은 진입하지 않습니다.\n"
-            )
-            print(msg)
-            send_telegram(msg)
-
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[FUNDING] 오류: {e}\n{tb}")
-        send_telegram(f"[FUNDING] 오류: {e}")
 
 
 # ==============================
@@ -688,13 +638,10 @@ def main_loop() -> None:
                 if ex_name in exchanges:
                     run_triangular_arb(ex_name)
 
-            # 5) 펀딩비 모니터링
-            monitor_funding()
-
-            # 6) 일일 24시간 수익 리포트 (매일 9시)
+            # 5) 일일 24시간 수익 리포트 (매일 9시)
             send_daily_report_if_needed()
 
-            # 7) 상태 보고 (1시간마다)
+            # 6) 상태 보고 (1시간마다)
             now = now_ts()
             if now - last_status_time >= STATUS_INTERVAL:
                 msg = (
