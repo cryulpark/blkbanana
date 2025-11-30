@@ -51,24 +51,22 @@ async def get_exchange_rate():
         try:
             return exchanges['bithumb'].fetch_ticker('USDT/KRW')['bid']
         except Exception as e:
-            await send_telegram(f"환율 오류: {e} – 기본 1350 사용")
+            print(f"환율 오류: {e} – 기본 1350 사용")  # 알림 제거, 콘솔 로그만
             return 1350
 
 async def get_spread(target_ex, pair, krw_pair):
     try:
-        base_ticker = exchanges['binance'].fetch_ticker(pair)
-        btc_base = base_ticker['bid']
-        target_ticker = exchanges[target_ex].fetch_ticker(krw_pair)
-        btc_target = target_ticker['ask'] / await get_exchange_rate()
-        spread = (btc_target / btc_base - 1) * 100
+        base_price = exchanges['binance'].fetch_ticker(pair)['bid']
+        target_price = exchanges[target_ex].fetch_ticker(krw_pair)['ask'] / await get_exchange_rate()
+        spread = (target_price / base_price - 1) * 100
         return spread
     except Exception as e:
-        await send_telegram(f"{target_ex} Spread 오류: {e}")
+        print(f"{target_ex} Spread 오류: {e}")  # 알림 제거, 콘솔 로그만
         return 0
 
 # 메인 루프 (풀세트 자동, 안전 모드)
 async def main():
-    await send_telegram("까망빠나나 시작! Railway 도쿄에서 24/7 실행 중.")
+    await send_telegram("까망빠나나 시작! Railway 도쿄에서 24/7 실행 중.")  # 시작 알림 유지
     last_status_time = time.time()
     while True:
         try:
@@ -84,9 +82,13 @@ async def main():
                 exchanges[max_spread_ex].create_market_sell_order('BTC/KRW', (await get_exchange_rate()) * amount * (btc_base + 0.01 * btc_base))
                 profit = spread * amount * 20000
                 await send_telegram(f"Arbitrage 실행! {max_spread_ex} Spread {spread:.2f}% - 예상 수익 +{profit:.0f}원")
-            await asyncio.sleep(60)
+            if time.time() - last_status_time >= 3600:
+                await send_telegram(f"상태 확인: 정상. 누적 수익 +{last_profit:.0f}원")
+                last_status_time = time.time()
+            await asyncio.sleep(300)  # 5분 루프 (rate limit 최적화, 꾸준함 강화)
         except Exception as e:
-            await send_telegram(f"봇 재시작: {e}")
-            await asyncio.sleep(10)  # 안전 재시작 딜레이
+            print(f"봇 재시작: {e}")  # 알림 제거, 콘솔 로그만
+            await asyncio.sleep(10)
 
-asyncio.run(main())
+if __name__ == '__main__':
+    asyncio.run(main())
