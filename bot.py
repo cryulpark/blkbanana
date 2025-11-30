@@ -25,11 +25,13 @@ STATUS_INTERVAL = 3600  # 1시간
 THRESHOLD_MIN = 1.3   # 가장 공격적일 때
 THRESHOLD_MAX = 1.8   # 가장 보수적일 때
 
+# ratio(한 번에 잔고에서 사용할 비율) 범위
+BASE_RATIO_MIN = 0.3   # 최소 30%
+BASE_RATIO_MAX = 0.6   # 최대 60%
+CURRENT_RATIO  = 0.5   # 실제 사용하는 비율 (auto-tuning 대상)
+
 # 삼각 차익 기준 (스프레드 %)
 MIN_TRIANGULAR_SPREAD = 0.5   # 0.5% 이상만 실행
-
-# 거래 시 잔고에서 사용하는 비율 (예: 0.5면 잔고의 50%까지 사용)
-USE_BALANCE_RATIO = 0.5
 
 # 최소 체결 금액 (KRW 기준)
 MIN_NOTIONAL_KRW = 100000  # 10만원
@@ -92,7 +94,7 @@ TRADE_LOG: List[Dict[str, Any]] = []
 # 일일 리포트 발송 여부 체크용 (날짜별 딱 한 번)
 last_daily_report_date: str = ""  # "YYYY-MM-DD"
 
-# 트레이드 타임스탬프 (빈도/auto-threshold용)
+# 트레이드 타임스탬프 (빈도/auto-param용)
 TRADE_TIMES: List[float] = []
 
 # 전체 봇 정지 플래그 (필요시 사용)
@@ -304,35 +306,56 @@ def trades_last_hour() -> int:
     return len(recent)
 
 
-def auto_threshold(vol: float, trade_count_last_hour: int) -> float:
+def auto_params(vol: float, trade_count_last_hour: int) -> Tuple[float, float]:
     """
-    변동성과 최근 1시간 거래 수를 기반으로 동적으로 threshold 설정.
-    - 변동성 높을수록 threshold ↑ (안전)
-    - 거래 횟수 많을수록 threshold ↑ (과열 방지)
-    - 변동성 낮고, 거래 적으면 threshold ↓ (기회 더 많이)
+    변동성과 최근 1시간 거래 수를 기반으로 동적으로
+    threshold(스프레드 기준)와 ratio(잔고 사용 비율)를 설정.
     """
-    # 변동성 기반 맵핑 (0 ~ VOL_THRESHOLD_BORDER 를 THRESHOLD_MAX ~ THRESHOLD_MIN으로)
+    # ---- threshold 계산 ----
     v = min(max(vol, 0.0), VOL_THRESHOLD_BORDER)
     if VOL_THRESHOLD_BORDER > 0:
-        base = THRESHOLD_MAX - (v / VOL_THRESHOLD_BORDER) * (THRESHOLD_MAX - THRESHOLD_MIN)
+        # 변동성 0%일 때 THRESHOLD_MIN, 변동성 클수록 THRESHOLD_MAX에 가까워짐
+        threshold = THRESHOLD_MIN + (v / VOL_THRESHOLD_BORDER) * (THRESHOLD_MAX - THRESHOLD_MIN)
     else:
-        base = THRESHOLD_MAX
+        threshold = THRESHOLD_MAX
 
-    # 거래 횟수 조정: 너무 많이 거래하면 threshold 올려서 브레이크
-    if trade_count_last_hour > MAX_TRADES_1H * 0.8:
-        base += 0.3
-    elif trade_count_last_hour > MAX_TRADES_1H * 0.5:
-        base += 0.15
-    elif trade_count_last_hour < 3:
-        base -= 0.1  # 너무 조용하면 살짝 낮춤
+    # 거래 횟수가 많으면 threshold 조금 올림 (과열 구간 필터링)
+    if trade_count_last_hour > MAX_TRADES_1H * 0.7:
+        threshold += 0.3
+    elif trade_count_last_hour > MAX_TRADES_1H * 0.4:
+        threshold += 0.1
+    elif trade_count_last_hour < 3 and vol < VOL_THRESHOLD_BORDER * 0.3:
+        threshold -= 0.1  # 너무 조용하면 살짝 낮춤
 
-    # 클램핑
-    base = max(THRESHOLD_MIN, min(THRESHOLD_MAX + 0.3, base))
-    return base
+    threshold = max(THRESHOLD_MIN, min(THRESHOLD_MAX + 0.3, threshold))
+
+    # ---- ratio 계산 ----
+    # 기본값 0.45 정도에서 변동성 높으면 내려가고, 낮으면 올라가는 구조
+    # 또한 거래가 너무 많으면 비율을 줄여 안전 모드
+    base_ratio = 0.45
+
+    # 변동성 기반: vol가 클수록 ratio 감소
+    if VOL_THRESHOLD_BORDER > 0:
+        vol_factor = (v / VOL_THRESHOLD_BORDER)  # 0 ~ 1
+    else:
+        vol_factor = 1.0
+    base_ratio -= vol_factor * 0.15  # 최대 0.15 감소
+
+    # 거래 횟수 기반: 많이 거래됐으면 비율 줄이기
+    if trade_count_last_hour > MAX_TRADES_1H * 0.7:
+        base_ratio -= 0.1
+    elif trade_count_last_hour > MAX_TRADES_1H * 0.4:
+        base_ratio -= 0.05
+    elif trade_count_last_hour < 3 and vol < VOL_THRESHOLD_BORDER * 0.3:
+        base_ratio += 0.05  # 너무 조용하면 조금 더 쓰자
+
+    ratio = max(BASE_RATIO_MIN, min(BASE_RATIO_MAX, base_ratio))
+
+    return threshold, ratio
 
 
 # ==============================
-# 5. 현물 재정거래 (동적 사이즈, auto-threshold)
+# 5. 현물 재정거래 (동적 사이즈, auto-threshold/ratio)
 # ==============================
 
 def est_profit_krw(spread_pct: float, base_price_usdt: float, amount: float, usdt_krw: float) -> float:
@@ -344,10 +367,11 @@ def est_profit_krw(spread_pct: float, base_price_usdt: float, amount: float, usd
     return profit_usdt * usdt_krw
 
 
-def run_spot_arbitrage(symbol: str, threshold: float) -> None:
+def run_spot_arbitrage(symbol: str, threshold: float, ratio: float) -> None:
     """
     Binance 현물 vs (Upbit/Bithumb) KRW 김치프 재정거래.
     symbol: 'BTC' / 'ETH'
+    ratio: 이 거래에서 사용할 잔고 비율
     """
     global cumulative_profit_krw
 
@@ -361,12 +385,10 @@ def run_spot_arbitrage(symbol: str, threshold: float) -> None:
         binance = exchanges["binance"]
         usdt_krw = get_usdt_krw_rate()
 
-        # 바이낸스 기준 가격 (USDT)
         base_pair = f"{symbol}/USDT"
         bin_ticker = safe_fetch_ticker(binance, base_pair)
         base_price_usdt = float(bin_ticker["bid"])
 
-        # 바이낸스 잔고
         bin_balance = binance.fetch_balance()
         bin_free_usdt = get_free(bin_balance, "USDT")
         bin_free_symbol = get_free(bin_balance, symbol)
@@ -393,7 +415,7 @@ def run_spot_arbitrage(symbol: str, threshold: float) -> None:
 
             print(
                 f"[ARBITRAGE] {symbol} @ {venue} premium_sell={premium_sell:.2f}%, "
-                f"premium_buy={premium_buy:.2f}% (threshold={threshold:.2f}%)"
+                f"premium_buy={premium_buy:.2f}% (threshold={threshold:.2f}%, ratio={ratio:.2f})"
             )
 
             try:
@@ -417,8 +439,8 @@ def run_spot_arbitrage(symbol: str, threshold: float) -> None:
                         print("[ARBITRAGE] 1시간 거래 횟수 한도 도달 – 스킵")
                         continue
 
-                    max_from_usdt = (bin_free_usdt * USE_BALANCE_RATIO) / base_price_usdt
-                    max_from_symbol = ex_free_symbol * USE_BALANCE_RATIO
+                    max_from_usdt = (bin_free_usdt * ratio) / base_price_usdt
+                    max_from_symbol = ex_free_symbol * ratio
                     trade_amount = min(max_from_usdt, max_from_symbol)
 
                     notional_krw = trade_amount * bid_krw
@@ -445,6 +467,7 @@ def run_spot_arbitrage(symbol: str, threshold: float) -> None:
                                     f"- 수량: {trade_amount:.6f} {symbol}\n"
                                     f"- 추정 이익: {format_krw(est_profit)}\n"
                                     f"- 누적 추정 이익: {format_krw(cumulative_profit_krw)}\n"
+                                    f"- ratio: {ratio:.2f}\n"
                                     f"- DRY_RUN: {DRY_RUN}"
                                 )
                                 print(msg)
@@ -463,8 +486,8 @@ def run_spot_arbitrage(symbol: str, threshold: float) -> None:
                         print("[ARBITRAGE] 1시간 거래 횟수 한도 도달 – 스킵")
                         continue
 
-                    max_from_krw = (ex_free_krw * USE_BALANCE_RATIO) / ask_krw
-                    max_from_bin_symbol = bin_free_symbol * USE_BALANCE_RATIO
+                    max_from_krw = (ex_free_krw * ratio) / ask_krw
+                    max_from_bin_symbol = bin_free_symbol * ratio
                     trade_amount = min(max_from_krw, max_from_bin_symbol)
 
                     notional_krw = trade_amount * ask_krw
@@ -491,6 +514,7 @@ def run_spot_arbitrage(symbol: str, threshold: float) -> None:
                                     f"- 수량: {trade_amount:.6f} {symbol}\n"
                                     f"- 추정 이익: {format_krw(est_profit)}\n"
                                     f"- 누적 추정 이익: {format_krw(cumulative_profit_krw)}\n"
+                                    f"- ratio: {ratio:.2f}\n"
                                     f"- DRY_RUN: {DRY_RUN}"
                                 )
                                 print(msg)
@@ -633,7 +657,6 @@ def send_daily_report_if_needed() -> None:
     lines.append("")
 
     for (strategy, symbol), data in summary.items():
-        분야명 = ""
         if strategy == "spot_arb":
             분야명 = f"{symbol} 현물 재정거래"
         elif strategy == "triangular":
@@ -642,9 +665,7 @@ def send_daily_report_if_needed() -> None:
             분야명 = f"{strategy}/{symbol}"
 
         lines.append(
-            f"· {분야명}: "
-            f"{format_krw(data['profit'])} "
-            f"(거래 {data['count']}회)"
+            f"· {분야명}: {format_krw(data['profit'])} (거래 {data['count']}회)"
         )
 
     lines.append("")
@@ -662,27 +683,27 @@ def send_daily_report_if_needed() -> None:
 # ==============================
 
 def main_loop() -> None:
-    global last_status_time
+    global last_status_time, CURRENT_RATIO
 
-    send_telegram(f"까망빠나나 시작! DRY_RUN={DRY_RUN} / auto-threshold 모드로 24/7 모니터링 중.")
+    send_telegram(f"까망빠나나 시작! DRY_RUN={DRY_RUN} / auto-threshold+ratio 모드로 24/7 모니터링 중.")
 
     while True:
         loop_start = now_ts()
         try:
-            # 변동성 + 최근 1시간 거래수 기반 auto-threshold 계산
             vol = get_daily_volatility()
             trade_count = trades_last_hour()
-            threshold = auto_threshold(vol, trade_count)
+            threshold, ratio = auto_params(vol, trade_count)
+            CURRENT_RATIO = ratio
 
             print(
-                f"[LOOP] 시작 – 일간 변동성={vol:.2f}% / "
+                f"[LOOP] 시작 – 변동성={vol:.2f}% / "
                 f"최근 1시간 거래횟수={trade_count} / "
-                f"동적 스프레드 기준={threshold:.2f}%"
+                f"threshold={threshold:.2f}% / ratio={ratio:.2f}"
             )
 
             if not disable_trading:
-                run_spot_arbitrage("BTC", threshold)
-                run_spot_arbitrage("ETH", threshold)
+                run_spot_arbitrage("BTC", threshold, ratio)
+                run_spot_arbitrage("ETH", threshold, ratio)
 
                 for ex_name in ["bybit", "okx"]:
                     if ex_name in exchanges:
@@ -690,10 +711,8 @@ def main_loop() -> None:
             else:
                 print("[LOOP] trading disabled – 매매 로직 스킵")
 
-            # 일일 24시간 수익 리포트 (매일 9시)
             send_daily_report_if_needed()
 
-            # 상태 보고 (1시간마다)
             now = now_ts()
             if now - last_status_time >= STATUS_INTERVAL:
                 daily_pnl = compute_today_profit_krw()
@@ -702,7 +721,8 @@ def main_loop() -> None:
                     f"- 오늘 손익: {format_krw(daily_pnl)}\n"
                     f"- 누적 추정 이익: {format_krw(cumulative_profit_krw)}\n"
                     f"- 최근 1시간 거래횟수: {trades_last_hour()}회\n"
-                    f"- 최신 threshold: {threshold:.2f}%\n"
+                    f"- 현재 threshold: {threshold:.2f}%\n"
+                    f"- 현재 ratio: {ratio:.2f}\n"
                     f"- DRY_RUN: {DRY_RUN}\n"
                 )
                 print(msg)
