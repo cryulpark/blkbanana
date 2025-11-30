@@ -14,7 +14,7 @@ from telegram import Bot  # python-telegram-bot==20.7
 # 실매매 여부 (True = 실제 주문, False = 시뮬레이션)
 DRY_RUN = True
 
-# 기본 루프 주기(초)
+# 루프 주기(초)
 MAIN_LOOP_INTERVAL = 60  # 1분
 
 # 상태 보고 주기(초)
@@ -29,11 +29,14 @@ VOL_THRESHOLD_BORDER = 10.0  # 변동성 10% 기준
 MIN_TRIANGULAR_SPREAD = 0.5   # %
 MIN_FUNDING_RATE = 0.01       # 1%
 
-# 1회 주문 수량 (예시)
-BTC_AMOUNT = 0.001
-ETH_AMOUNT = 0.01
+# 거래 시 잔고에서 사용하는 비율 (예: 0.5면 잔고의 50%까지 사용)
+USE_BALANCE_RATIO = 0.5
 
-# 전략별 쿨다운(초) – 동일 전략/심볼/거래소 기준
+# 최소 체결 금액 (KRW 기준, 이보다 작으면 거래 안 함 – 수수료/미니멈 방지용)
+MIN_NOTIONAL_KRW = 50000  # 5만원
+
+
+# 쿨다운(초) – 동일 전략/심볼/거래소 기준
 ARBITRAGE_COOLDOWN = 300  # 5분
 
 
@@ -133,7 +136,7 @@ def send_telegram(message: str) -> None:
     try:
         asyncio.run(_send())
     except RuntimeError:
-        # 이미 다른 이벤트 루프가 돌고 있는 특수 환경 대비 (일반 Railway에서는 거의 없음)
+        # 이미 다른 이벤트 루프가 돌고 있는 특수 환경 대비
         print("[TELEGRAM] asyncio 루프 충돌 – 메시지 전송 스킵")
 
 
@@ -200,59 +203,6 @@ def get_daily_volatility() -> float:
         return 0.0
 
 
-def get_binance_spot_price(symbol: str) -> float:
-    """
-    바이낸스 현물 기준가 (bid, USDT).
-    symbol: 'BTC' / 'ETH'
-    """
-    ex = exchanges["binance"]
-    pair = f"{symbol}/USDT"
-    t = safe_fetch_ticker(ex, pair)
-    return float(t["bid"])
-
-
-def get_krw_spread(symbol: str, usdt_krw: float) -> Dict[str, Dict[str, float]]:
-    """
-    업비트/빗썸 KRW 마켓 vs 바이낸스 현물(USDT) 스프레드 계산.
-
-    반환:
-    {
-      "upbit":  {"spread": float, "ask_krw": float, "base_price_usdt": float},
-      "bithumb":{"spread": float, "ask_krw": float, "base_price_usdt": float},
-    }
-    """
-    result: Dict[str, Dict[str, float]] = {}
-    base_price_usdt = get_binance_spot_price(symbol)
-    krw_pair = f"{symbol}/KRW"
-
-    for name in ["upbit", "bithumb"]:
-        ex = exchanges.get(name)
-        if not ex:
-            continue
-        try:
-            t = safe_fetch_ticker(ex, krw_pair)
-            ask_krw = float(t["ask"])
-            ask_usdt = ask_krw / usdt_krw
-            spread = (ask_usdt / base_price_usdt - 1.0) * 100.0
-            result[name] = {
-                "spread": spread,
-                "ask_krw": ask_krw,
-                "base_price_usdt": base_price_usdt,
-            }
-        except Exception as e:
-            print(f"[SPREAD] {name} {symbol}/KRW 조회 실패: {e}")
-
-    return result
-
-
-def est_profit_krw(spread_pct: float, base_price_usdt: float, amount: float, usdt_krw: float) -> float:
-    """
-    단순 추정 수익(수수료/슬리피지 미반영).
-    """
-    profit_usdt = (spread_pct / 100.0) * base_price_usdt * amount
-    return profit_usdt * usdt_krw
-
-
 def create_market_order(ex: ccxt.Exchange, symbol: str, side: str, amount: float, params: Dict[str, Any] = None) -> Any:
     """
     마켓 주문 헬퍼. DRY_RUN=True면 실제 주문 대신 로그만 출력.
@@ -268,76 +218,215 @@ def create_market_order(ex: ccxt.Exchange, symbol: str, side: str, amount: float
         return ex.create_market_sell_order(symbol, amount, params)
 
 
+def get_free(balance: Dict[str, Any], currency: str) -> float:
+    """
+    balance 딕셔너리에서 특정 통화의 free 잔고 가져오기.
+    """
+    info = balance.get(currency, {})
+    return float(info.get("free", 0.0) or 0.0)
+
+
 # ==============================
-# 5. 전략 구현
+# 5. 현물 재정거래 (동적 사이즈, 복리)
 # ==============================
 
-def run_spot_arbitrage(symbol: str, amount: float, threshold: float) -> None:
+def run_spot_arbitrage(symbol: str, threshold: float) -> None:
     """
     Binance 현물 vs (Upbit/Bithumb) KRW 김치프 재정거래.
     symbol: 'BTC' / 'ETH'
+
+    방향 1) KRW 거래소 비쌈 (프리미엄 > threshold):
+        - KRW 거래소에서 symbol 매도
+        - Binance에서 symbol 매수
+        필요 잔고:
+        - KRW 거래소: symbol (BTC/ETH)
+        - Binance: USDT
+
+    방향 2) KRW 거래소 쌈 (프리미엄 < -threshold):
+        - KRW 거래소에서 symbol 매수
+        - Binance에서 symbol 매도
+        필요 잔고:
+        - KRW 거래소: KRW
+        - Binance: symbol (BTC/ETH)
     """
     global cumulative_profit_krw
 
     strategy_name = "spot_arbitrage"
 
     try:
-        usdt_krw = get_usdt_krw_rate()
-        spreads = get_krw_spread(symbol, usdt_krw)
-        if not spreads:
-            return
-
-        # 최대 스프레드 거래소 선택
-        best_name = max(spreads.keys(), key=lambda k: spreads[k]["spread"])
-        best_spread = spreads[best_name]["spread"]
-        best_ask_krw = spreads[best_name]["ask_krw"]
-        base_price_usdt = spreads[best_name]["base_price_usdt"]
-
-        print(f"[ARBITRAGE] {symbol} best={best_name} spread={best_spread:.2f}% threshold={threshold:.2f}%")
-
-        if best_spread <= threshold:
-            return
-
-        # 쿨다운 체크
-        if in_cooldown(strategy_name, symbol, best_name, ARBITRAGE_COOLDOWN):
-            print(f"[ARBITRAGE] {symbol} {best_name} 쿨다운 중 – 진입 건너뜀")
-            return
-
         binance = exchanges["binance"]
-        target_ex = exchanges[best_name]
+        usdt_krw = get_usdt_krw_rate()
 
-        # 1) 바이낸스에서 매수
+        # 바이낸스 기준 가격 (USDT)
         base_pair = f"{symbol}/USDT"
-        create_market_order(binance, base_pair, "buy", amount)
+        bin_ticker = safe_fetch_ticker(binance, base_pair)
+        base_price_usdt = float(bin_ticker["bid"])  # 우리가 살 때는 bid 기준으로 보수적으로
 
-        # 2) 타 거래소에서 같은 수량 매도
-        krw_pair = f"{symbol}/KRW"
-        create_market_order(target_ex, krw_pair, "sell", amount)
+        # 바이낸스 잔고
+        bin_balance = binance.fetch_balance()
+        bin_free_usdt = get_free(bin_balance, "USDT")
+        bin_free_symbol = get_free(bin_balance, symbol)
 
-        est_profit = est_profit_krw(best_spread, base_price_usdt, amount, usdt_krw)
-        cumulative_profit_krw += est_profit
+        # 각 KRW 거래소(upbit, bithumb)별로 기회 체크
+        for venue in ["upbit", "bithumb"]:
+            ex = exchanges.get(venue)
+            if not ex:
+                continue
 
-        touch_trade_time(strategy_name, symbol, best_name)
+            try:
+                krw_pair = f"{symbol}/KRW"
+                t = safe_fetch_ticker(ex, krw_pair)
+                ask_krw = float(t["ask"])
+                bid_krw = float(t["bid"])
+            except Exception as e:
+                print(f"[ARBITRAGE] {venue} {symbol}/KRW 티커 실패: {e}")
+                continue
 
-        msg = (
-            f"[{symbol}] 현물 재정거래 실행\n"
-            f"- 대상 거래소: {best_name}\n"
-            f"- 스프레드: {best_spread:.2f}% (기준 {threshold:.2f}%)\n"
-            f"- 수량: {amount} {symbol}\n"
-            f"- 기준가(Binance): {base_price_usdt:.2f} USDT\n"
-            f"- 매도가({best_name}): {best_ask_krw:,.0f} KRW\n"
-            f"- 추정 이익: +{est_profit:,.0f}원\n"
-            f"- 누적 추정 이익: +{cumulative_profit_krw:,.0f}원\n"
-            f"- DRY_RUN: {DRY_RUN}"
-        )
-        print(msg)
-        send_telegram(msg)
+            # KRW 거래소 가격을 USDT로 변환
+            ask_usdt = ask_krw / usdt_krw
+            bid_usdt = bid_krw / usdt_krw
+
+            # 프리미엄 계산: KRW 거래소 기준 ask vs Binance bid
+            # (우리가 KRW 거래소에서 팔면 bid, 살 때는 ask를 사용)
+            # 여기서는 두 방향을 모두 본다.
+            # 방향1: KRW 비쌈 → KRW bid 기준으로 프리미엄 계산
+            premium_sell = (bid_usdt / base_price_usdt - 1.0) * 100.0
+            # 방향2: KRW 쌈 → KRW ask 기준으로 디스카운트 계산
+            premium_buy = (ask_usdt / base_price_usdt - 1.0) * 100.0
+
+            print(
+                f"[ARBITRAGE] {symbol} @ {venue} premium_sell={premium_sell:.2f}%, premium_buy={premium_buy:.2f}% "
+                f"(threshold={threshold:.2f}%)"
+            )
+
+            balance_krw_ex = ex.fetch_balance()
+            ex_free_krw = get_free(balance_krw_ex, "KRW")
+            ex_free_symbol = get_free(balance_krw_ex, symbol)
+
+            # ---------------------
+            # 방향 1: KRW 거래소가 비쌀 때 (sell premium)
+            # ---------------------
+            if premium_sell > threshold:
+                # 필요 잔고:
+                # - Binance: USDT
+                # - venue: symbol (BTC/ETH)
+                if bin_free_usdt <= 0 or ex_free_symbol <= 0:
+                    print(f"[ARBITRAGE] {symbol} {venue} 방향1 불가 – 잔고 부족 (USDT or {symbol})")
+                else:
+                    # Binance USDT에서 쓸 수 있는 BTC/ETH 수량
+                    max_from_usdt = (bin_free_usdt * USE_BALANCE_RATIO) / base_price_usdt
+                    # venue에서 팔 수 있는 BTC/ETH 수량
+                    max_from_symbol = ex_free_symbol * USE_BALANCE_RATIO
+
+                    trade_amount = min(max_from_usdt, max_from_symbol)
+
+                    # KRW 기준 노치널 체크
+                    notional_krw = trade_amount * bid_krw
+                    if trade_amount <= 0 or notional_krw < MIN_NOTIONAL_KRW:
+                        print(f"[ARBITRAGE] {symbol} {venue} 방향1 – 금액 너무 작음, 스킵 (notional={notional_krw:.0f}원)")
+                    else:
+                        # 쿨다운 체크
+                        if in_cooldown(strategy_name, symbol, venue + "_sell", ARBITRAGE_COOLDOWN):
+                            print(f"[ARBITRAGE] {symbol} {venue} 방향1 – 쿨다운 중, 스킵")
+                        else:
+                            # Binance에서 매수, venue에서 매도
+                            try:
+                                create_market_order(binance, base_pair, "buy", trade_amount)
+                                create_market_order(ex, krw_pair, "sell", trade_amount)
+
+                                est_profit = est_profit_krw(premium_sell, base_price_usdt, trade_amount, usdt_krw)
+                                cumulative_profit_krw += est_profit
+
+                                touch_trade_time(strategy_name, symbol, venue + "_sell")
+
+                                msg = (
+                                    f"[{symbol}] 재정거래 실행 (KRW 비쌈, {venue}에서 매도)\n"
+                                    f"- venue: {venue}\n"
+                                    f"- 방향: {venue} SELL, Binance BUY\n"
+                                    f"- premium_sell: {premium_sell:.2f}%\n"
+                                    f"- 수량: {trade_amount:.6f} {symbol}\n"
+                                    f"- 추정 이익: +{est_profit:,.0f}원\n"
+                                    f"- 누적 추정 이익: +{cumulative_profit_krw:,.0f}원\n"
+                                    f"- DRY_RUN: {DRY_RUN}"
+                                )
+                                print(msg)
+                                send_telegram(msg)
+                            except Exception as e:
+                                tb = traceback.format_exc()
+                                print(f"[ARBITRAGE] {symbol} {venue} 방향1 주문 오류: {e}\n{tb}")
+                                send_telegram(f"[ARBITRAGE] {symbol} {venue} 방향1 주문 오류: {e}")
+
+            # ---------------------
+            # 방향 2: KRW 거래소가 쌀 때 (buy discount)
+            # ---------------------
+            if premium_buy < -threshold:
+                # 필요 잔고:
+                # - venue: KRW
+                # - Binance: symbol (BTC/ETH)
+                if ex_free_krw <= 0 or bin_free_symbol <= 0:
+                    print(f"[ARBITRAGE] {symbol} {venue} 방향2 불가 – 잔고 부족 (KRW or {symbol})")
+                else:
+                    # venue의 KRW에서 살 수 있는 BTC/ETH 수량
+                    max_from_krw = (ex_free_krw * USE_BALANCE_RATIO) / ask_krw
+                    # Binance에서 팔 수 있는 BTC/ETH 수량
+                    max_from_bin_symbol = bin_free_symbol * USE_BALANCE_RATIO
+
+                    trade_amount = min(max_from_krw, max_from_bin_symbol)
+
+                    notional_krw = trade_amount * ask_krw
+                    if trade_amount <= 0 or notional_krw < MIN_NOTIONAL_KRW:
+                        print(f"[ARBITRAGE] {symbol} {venue} 방향2 – 금액 너무 작음, 스킵 (notional={notional_krw:.0f}원)")
+                    else:
+                        # 쿨다운 체크
+                        if in_cooldown(strategy_name, symbol, venue + "_buy", ARBITRAGE_COOLDOWN):
+                            print(f"[ARBITRAGE] {symbol} {venue} 방향2 – 쿨다운 중, 스킵")
+                        else:
+                            try:
+                                # venue에서 매수, Binance에서 매도
+                                create_market_order(ex, krw_pair, "buy", trade_amount)
+                                create_market_order(binance, base_pair, "sell", trade_amount)
+
+                                # premium_buy는 음수이므로 절대값으로 이익 추정
+                                est_profit = est_profit_krw(-premium_buy, base_price_usdt, trade_amount, usdt_krw)
+                                cumulative_profit_krw += est_profit
+
+                                touch_trade_time(strategy_name, symbol, venue + "_buy")
+
+                                msg = (
+                                    f"[{symbol}] 재정거래 실행 (KRW 쌈, {venue}에서 매수)\n"
+                                    f"- venue: {venue}\n"
+                                    f"- 방향: {venue} BUY, Binance SELL\n"
+                                    f"- discount: {premium_buy:.2f}%\n"
+                                    f"- 수량: {trade_amount:.6f} {symbol}\n"
+                                    f"- 추정 이익: +{est_profit:,.0f}원\n"
+                                    f"- 누적 추정 이익: +{cumulative_profit_krw:,.0f}원\n"
+                                    f"- DRY_RUN: {DRY_RUN}"
+                                )
+                                print(msg)
+                                send_telegram(msg)
+                            except Exception as e:
+                                tb = traceback.format_exc()
+                                print(f"[ARBITRAGE] {symbol} {venue} 방향2 주문 오류: {e}\n{tb}")
+                                send_telegram(f"[ARBITRAGE] {symbol} {venue} 방향2 주문 오류: {e}")
 
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"[ARBITRAGE] {symbol} 오류: {e}\n{tb}")
-        send_telegram(f"[ARBITRAGE] {symbol} 오류: {e}")
+        print(f"[ARBITRAGE] {symbol} 전체 오류: {e}\n{tb}")
+        send_telegram(f"[ARBITRAGE] {symbol} 전체 오류: {e}")
 
+
+def est_profit_krw(spread_pct: float, base_price_usdt: float, amount: float, usdt_krw: float) -> float:
+    """
+    단순 추정 수익(수수료/슬리피지 미반영).
+    spread_pct: 절대값 스프레드 (%)
+    """
+    profit_usdt = (spread_pct / 100.0) * base_price_usdt * amount
+    return profit_usdt * usdt_krw
+
+
+# ==============================
+# 6. 삼각 차익 / 펀딩 (알림 위주, DRY_RUN 모의)
+# ==============================
 
 def run_triangular_arb(ex_name: str) -> None:
     """
@@ -359,7 +448,7 @@ def run_triangular_arb(ex_name: str) -> None:
         return
 
     try:
-        # 심볼 자동 선택 (spot, 또는 :USDT 선물 등)
+        # 심볼 자동 선택 (spot 또는 :USDT 선물 등)
         btc_usdt_sym = pick_symbol(ex, ["BTC/USDT", "BTC/USDT:USDT"])
         eth_usdt_sym = pick_symbol(ex, ["ETH/USDT", "ETH/USDT:USDT"])
         eth_btc_sym = pick_symbol(ex, ["ETH/BTC"])
@@ -459,7 +548,7 @@ def monitor_funding() -> None:
 
 
 # ==============================
-# 6. 메인 루프
+# 7. 메인 루프
 # ==============================
 
 def main_loop() -> None:
@@ -475,11 +564,11 @@ def main_loop() -> None:
             threshold = HIGH_VOL_THRESHOLD if vol >= VOL_THRESHOLD_BORDER else LOW_VOL_THRESHOLD
             print(f"[LOOP] 시작 – 일간 변동성={vol:.2f}% / 스프레드 기준={threshold:.2f}%")
 
-            # 2) BTC 현물 재정거래
-            run_spot_arbitrage("BTC", BTC_AMOUNT, threshold)
+            # 2) BTC 재정거래 (동적 사이즈)
+            run_spot_arbitrage("BTC", threshold)
 
-            # 3) ETH 현물 재정거래
-            run_spot_arbitrage("ETH", ETH_AMOUNT, threshold)
+            # 3) ETH 재정거래 (동적 사이즈)
+            run_spot_arbitrage("ETH", threshold)
 
             # 4) Bybit/OKX 삼각 차익 모니터링
             for ex_name in ["bybit", "okx"]:
