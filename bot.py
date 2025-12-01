@@ -47,8 +47,10 @@ KRW_ARB_THR = 0.25             # 0.25% 이상이면 차익거래 후보 (net edg
 KRW_ARB_RATIO = 0.2            # 업빗/빗썸 사이 KRW 차익거래는 계좌의 20% 정도만
 
 # ─ Funding 레이어(실제 포지션 진입 + 자동 청산) ─
-FUNDING_SPREAD_THR_OPEN  = 0.02   # 진입 기준: 스프레드 2% 이상일 때 진입 후보
-FUNDING_SPREAD_THR_CLOSE = 0.005  # 청산 기준: 스프레드가 0.5% 이하로 줄어들면 청산 후보
+FUTURES_SYMBOL = "BTC/USDT:USDT"   # ccxt 통일 심볼 (Binance/Bybit/OKX USDT 선물)
+
+FUNDING_SPREAD_THR_OPEN  = 0.02    # 진입 기준: 스프레드 2% 이상일 때 진입 후보
+FUNDING_SPREAD_THR_CLOSE = 0.005   # 청산 기준: 스프레드가 0.5% 이하로 줄어들면 청산 후보
 
 FUNDING_ARB_RATIO            = 0.10    # 각 선물 계좌 USDT의 몇 %를 펀딩 아비트에 사용할지
 FUNDING_MIN_NOTIONAL_USDT    = 100.0   # 이 미만이면 진입 안 함
@@ -138,7 +140,7 @@ FUNDING_POS = {
     "active": False,
     "short_ex": None,         # "binance_fut" / "bybit_fut" / "okx_fut"
     "long_ex":  None,
-    "symbol":   "BTC/USDT",
+    "symbol":   FUTURES_SYMBOL,
     "amount":   0.0,
     "open_spread": 0.0,       # 진입 당시 funding spread
     "open_time":   0.0,       # 진입 시각 (timestamp)
@@ -748,7 +750,7 @@ def funding_arbitrage_signals():
         try:
             bin_fut = ex_fut.get("binance_fut")
             if bin_fut:
-                fr = bin_fut.fetch_funding_rate("BTC/USDT")
+                fr = bin_fut.fetch_funding_rate(FUTURES_SYMBOL)
                 rates["binance_fut"] = fr["fundingRate"]
         except Exception as e:
             print(f"[FUND] binance_fut ERR {e}")
@@ -757,11 +759,8 @@ def funding_arbitrage_signals():
         try:
             bybit_fut = ex_fut.get("bybit_fut")
             if bybit_fut:
-                frs = bybit_fut.fetch_funding_rates()
-                for r in frs:
-                    if r.get("symbol") in ["BTC/USDT", "BTCUSDT"]:
-                        rates["bybit_fut"] = r.get("fundingRate", 0)
-                        break
+                fr = bybit_fut.fetch_funding_rate(FUTURES_SYMBOL)
+                rates["bybit_fut"] = fr["fundingRate"]
         except Exception as e:
             print(f"[FUND] bybit_fut ERR {e}")
 
@@ -769,11 +768,8 @@ def funding_arbitrage_signals():
         try:
             okx_fut = ex_fut.get("okx_fut")
             if okx_fut:
-                frs = okx_fut.fetch_funding_rates()
-                for r in frs:
-                    if r.get("symbol") in ["BTC-USDT-SWAP", "BTC/USDT:USDT"]:
-                        rates["okx_fut"] = r.get("fundingRate", 0)
-                        break
+                fr = okx_fut.fetch_funding_rate(FUTURES_SYMBOL)
+                rates["okx_fut"] = fr["fundingRate"]
         except Exception as e:
             print(f"[FUND] okx_fut ERR {e}")
 
@@ -881,7 +877,7 @@ def funding_arbitrage_signals():
             print("[FUND] missing futures instance for open")
             return
 
-        symbol = "BTC/USDT"
+        symbol = FUTURES_SYMBOL
 
         # 가격
         t_high = safe_ticker(high_ex, symbol)
