@@ -49,7 +49,7 @@ PREMIUM_PRED_WEIGHTS = {
 # 리밸런싱 관련
 REBALANCE_INTERVAL = 1800      # 30분마다 리밸런싱 체크
 REBALANCE_DRIFT = 0.15         # 15% 이상 목표 비율에서 벗어나면 리밸런싱
-REBALANCE_STEP = 0.3           # 드리프트의 30%만 한 번에 조정 (너무 과도 조정 방지)
+REBALANCE_STEP = 0.3           # 드리프트의 30%만 한 번에 조정
 
 # CSV 로그 파일
 TRADE_CSV = "trades.csv"
@@ -91,6 +91,7 @@ TRADE_LOG = []                       # {ts, strategy, symbol, venue, direction, 
 TRADE_TIMES = []                     # 최근 트레이드 시간 리스트
 last_status_time = time.time()
 last_daily_report_date = ""          # "YYYY-MM-DD"
+last_weekly_report_date = ""         # "YYYY-MM-DD" (주간 리포트용)
 disable_trading = False
 cumulative_profit_krw = 0.0
 
@@ -683,6 +684,72 @@ def send_daily_report_if_needed():
     last_daily_report_date = cur_date
 
 ###############################################################################
+# WEEKLY REPORT (최근 7일, 매주 월요일 9시)
+###############################################################################
+
+def send_weekly_report_if_needed():
+    global last_weekly_report_date
+    lt = time.localtime()
+    cur_date = f"{lt.tm_year:04d}-{lt.tm_mon:02d}-{lt.tm_mday:02d}"
+    # 월요일(0), 오전 9시에만
+    if lt.tm_wday != 0 or lt.tm_hour != 9:
+        return
+    if last_weekly_report_date == cur_date:
+        return
+
+    now = now_ts()
+    cutoff = now - 7*86400
+    recent = [t for t in TRADE_LOG if t["ts"] >= cutoff]
+
+    if not recent:
+        msg = (
+            f"[WEEKLY REPORT] {cur_date} 기준 최근 7일\n"
+            f"- 최근 7일 동안 실행된 거래가 없습니다.\n"
+            f"- DRY_RUN={DRY_RUN}"
+        )
+        print(msg); send_telegram(msg)
+        last_weekly_report_date = cur_date
+        return
+
+    total = 0.0
+    summary = {}
+    daily_map = {}
+    for t in recent:
+        day = today_date_str(t["ts"])
+        daily_map.setdefault(day,0.0)
+        daily_map[day] += t["profit_krw"]
+
+        key = (t["strategy"], t["symbol"])
+        total += t["profit_krw"]
+        if key not in summary:
+            summary[key] = {"p":0.0,"c":0}
+        summary[key]["p"] += t["profit_krw"]
+        summary[key]["c"] += 1
+
+    # 일별 최고/최저
+    best_day = max(daily_map.items(), key=lambda x:x[1])
+    worst_day= min(daily_map.items(), key=lambda x:x[1])
+
+    lines = []
+    lines.append(f"[WEEKLY REPORT] {cur_date} 기준 최근 7일 요약")
+    lines.append(f"- 7일 총 수익: {format_krw(total)}")
+    lines.append(f"- 일평균 수익: {format_krw(total/len(daily_map))}")
+    lines.append("")
+    lines.append(f"- 최고 수익일: {best_day[0]} ({format_krw(best_day[1])})")
+    lines.append(f"- 최저 수익일: {worst_day[0]} ({format_krw(worst_day[1])})")
+    lines.append("")
+    lines.append("[전략별 수익]")
+    for (st,sym),v in summary.items():
+        label = f"{sym} {st}"
+        lines.append(f"· {label}: {format_krw(v['p'])} (거래 {v['c']}회)")
+    lines.append("")
+    lines.append(f"- DRY_RUN={DRY_RUN}")
+
+    msg = "\n".join(lines)
+    print(msg); send_telegram(msg)
+    last_weekly_report_date = cur_date
+
+###############################################################################
 # REBALANCING (잔고 자동 재조정)
 ###############################################################################
 
@@ -707,39 +774,30 @@ def rebalance_binance():
         total = v_usdt+v_btc+v_eth
         if total <= 0: return
         targets = {"BTC":0.4,"ETH":0.3,"USDT":0.3}
-        cur = {"BTC":v_btc,"ETH":v_eth,"USDT":v_usdt}
-        for k in ["BTC","ETH","USDT"]:
-            cur[k] = cur[k]/total
-
+        cur = {"BTC":v_btc/total,"ETH":v_eth/total,"USDT":v_usdt/total}
         print(f"[REBAL BIN] cur={cur}")
-        # 예: BTC 비율이 target보다 15% 이상 많으면 일부를 USDT로
         for asset in ["BTC","ETH","USDT"]:
             drift = cur[asset]-targets[asset]
             if abs(drift) > REBALANCE_DRIFT:
-                # 조정해야할 비율
                 adj = drift*REBALANCE_STEP
-                adj_value = adj*total  # USDT 기준
+                adj_value = adj*total
                 if asset=="USDT":
-                    # USDT 과다 → BTC/ETH 비율 보고 적절히 배분 (여기선 BTC 쪽으로)
-                    if adj_value>0 and usdt>0:
-                        # USDT 너무 많다 → BTC/ETH 매수
+                    if adj>0 and usdt>0:
                         buy_amount = adj_value/float(t_btc["last"])
-                        print(f"[REBAL BIN] BUY BTC {buy_amount} (USDT 많음)")
+                        print(f"[REBAL BIN] BUY BTC {buy_amount}")
                         create_market_order(b,"BTC/USDT","buy",buy_amount)
                 elif asset=="BTC":
                     if adj>0:
-                        # BTC 너무 많다 → 일부 BTC → USDT로
-                        sell_amount = (adj_value/float(t_btc["last"]))
+                        sell_amount = adj_value/float(t_btc["last"])
                         print(f"[REBAL BIN] SELL BTC {sell_amount}")
                         create_market_order(b,"BTC/USDT","sell",sell_amount)
                     else:
-                        # BTC 너무 적다 → USDT로 BTC 매수
                         buy_amount = (-adj_value/float(t_btc["last"]))
                         print(f"[REBAL BIN] BUY BTC {buy_amount}")
                         create_market_order(b,"BTC/USDT","buy",buy_amount)
                 elif asset=="ETH":
                     if adj>0:
-                        sell_amount = (adj_value/float(t_eth["last"]))
+                        sell_amount = adj_value/float(t_eth["last"])
                         print(f"[REBAL BIN] SELL ETH {sell_amount}")
                         create_market_order(b,"ETH/USDT","sell",sell_amount)
                     else:
@@ -777,18 +835,15 @@ def rebalance_krw_exchange(name: str):
                 adj_value = adj*total
                 if asset=="KRW":
                     if adj>0:
-                        # KRW 너무 많음 → BTC 매수
                         buy_amount = adj_value/float(t_btc["last"])
                         print(f"[REBAL {name}] BUY BTC {buy_amount}")
                         create_market_order(inst,"BTC/KRW","buy",buy_amount)
                     else:
-                        # KRW 너무 적음 → BTC or ETH 매도 (여기선 BTC)
                         sell_amount = (-adj_value/float(t_btc["last"]))
                         print(f"[REBAL {name}] SELL BTC {sell_amount}")
                         create_market_order(inst,"BTC/KRW","sell",sell_amount)
                 elif asset=="BTC":
                     if adj>0:
-                        # BTC 너무 많음 → 일부 BTC 매도 → KRW
                         sell_amount = adj_value/float(t_btc["last"])
                         print(f"[REBAL {name}] SELL BTC {sell_amount}")
                         create_market_order(inst,"BTC/KRW","sell",sell_amount)
@@ -809,10 +864,6 @@ def rebalance_krw_exchange(name: str):
         print(f"[REBAL {name} ERR] {e}")
 
 def rebalance_all():
-    """
-    모든 주요 거래소 리밸런싱 실행.
-    DRY_RUN=True면 실제 주문 없이 로그만 남는다.
-    """
     print("[REBAL] 시작")
     rebalance_binance()
     rebalance_krw_exchange("upbit")
@@ -827,7 +878,7 @@ def main():
     global last_status_time, last_rebalance_ts, disable_trading
 
     init_exchanges()
-    send_telegram(f"김프봇 시작 (DRY_RUN={DRY_RUN}) – Realizable+Prediction+Risk+Rebalance+CSV")
+    send_telegram(f"김프봇 시작 (DRY_RUN={DRY_RUN}) – Realizable+Prediction+Risk+Rebalance+CSV+Weekly")
 
     trade_times = []
 
@@ -852,11 +903,12 @@ def main():
                 rebalance_all()
                 last_rebalance_ts = now
 
-            # 포트폴리오 스냅샷 (리밸런싱과 동기화)
+            # 포트폴리오 스냅샷
             snapshot_portfolio()
 
-            # 데일리 리포트
+            # 리포트들
             send_daily_report_if_needed()
+            send_weekly_report_if_needed()
 
             # 상태 리포트
             if now - last_status_time >= STATUS_INTERVAL:
