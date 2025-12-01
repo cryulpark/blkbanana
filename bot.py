@@ -2,7 +2,7 @@ import os
 import time
 import json
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 import ccxt
 from ccxt.base.errors import AuthenticationError
 
@@ -14,7 +14,8 @@ DRY_RUN = True                 # 실매매 전에는 반드시 True 유지
 MAIN_LOOP_INTERVAL = 60        # 1분 루프
 
 # ─ 리스크 관리 ─
-MAX_DAILY_LOSS_KRW = 300000    # 일일 허용 손실 한도 (예: 30만 원). 초과 시 자동 정지
+# 전체 자본 ≒ 21,500,000원, 허용 손실 2% → 약 430,000원
+MAX_DAILY_LOSS_KRW = 430000    # 일일 허용 손실 한도
 STATE_FILE = "kimchi_bot_state.json"
 
 # ─ Layer ON/OFF ─
@@ -32,15 +33,16 @@ TIER1_THR_MAX = 1.6            # 변동성 높을 때 1.6%까지
 TIER2_THR = 0.7                # 0.7% 이상이면 Tier2 후보
 
 # 기본 ratio (한 번에 잔고 몇 %까지 사용할지)
-BASE_RATIO_MIN = 0.4           # 최소 40%
-BASE_RATIO_MAX = 0.8           # 최대 80%
+# → 실매매 1단계: 30~60%로 완화 (기존 40~80%)
+BASE_RATIO_MIN = 0.3           # 최소 30%
+BASE_RATIO_MAX = 0.6           # 최대 60%
 TIER2_RATIO_FACTOR = 0.3       # Tier2는 기본 ratio의 30%만 사용
 
 # per-trade 최소 노치널 (KRW)
 MIN_NOTIONAL_KRW = 50000       # 5만 미만은 거래 안 함
 
 # 1시간 거래 횟수 제한
-MAX_TRADES_1H = 50             # 공격형: 1시간 최대 50회까지 허용
+MAX_TRADES_1H = 30             # 공격형 50 → 30으로 완화
 
 # ─ 업비트 ↔ 빗썸 KRW 차익 레이어 ─
 KRW_ARB_THR = 0.25             # 0.25% 이상이면 차익거래 후보 (net edge 필터로 추가 필터링)
@@ -52,8 +54,9 @@ FUTURES_SYMBOL = "BTC/USDT:USDT"   # ccxt 통일 심볼 (Binance/Bybit/OKX USDT 
 FUNDING_SPREAD_THR_OPEN  = 0.02    # 진입 기준: 스프레드 2% 이상일 때 진입 후보
 FUNDING_SPREAD_THR_CLOSE = 0.005   # 청산 기준: 스프레드가 0.5% 이하로 줄어들면 청산 후보
 
-FUNDING_ARB_RATIO            = 0.10    # 각 선물 계좌 USDT의 몇 %를 펀딩 아비트에 사용할지
-FUNDING_MIN_NOTIONAL_USDT    = 100.0   # 이 미만이면 진입 안 함
+# 선물 계좌는 대략 각 2,000 USDT 수준이므로, 10%만 사용 (≈ 200달러)
+FUNDING_ARB_RATIO            = 0.10    # 각 선물 계좌 USDT의 10% 사용
+FUNDING_MIN_NOTIONAL_USDT    = 100.0   # 100 USDT 미만이면 진입 안 함
 FUNDING_TARGET_PAYMENTS      = 3       # 목표 펀딩 횟수 (예: 3번 펀딩 받으면 청산)
 FUNDING_INTERVAL_HOURS       = 8.0     # 펀딩 간격(보통 8시간)
 FUNDING_MAX_HOURS_HOLD       = FUNDING_TARGET_PAYMENTS * FUNDING_INTERVAL_HOURS
@@ -70,7 +73,7 @@ PREMIUM_PRED_WEIGHTS = {
 }
 
 # ─ 수수료 / 슬리피지 / 최소 순엣지 설정 ─
-# 각 거래소 taker fee (대략값. 실제 계정 수수료에 맞게 반드시 수정)
+# 기본 티어 추정치 (필요하면 나중에 정확한 값으로 조정 가능)
 FEE_RATES = {
     "binance": 0.0004,     # 0.04%
     "upbit":   0.0005,     # 0.05%
@@ -80,7 +83,7 @@ FEE_RATES = {
 }
 DEFAULT_FEE_RATE = 0.0005
 
-# 수수료 외에 슬리피지 등을 고려한 쿠션 (단위: %)
+# 수수료 + 슬리피지 + 최소 순이익 여유 (단위: %)
 EDGE_BUFFER_FEE_PCT       = 0.20   # 왕복 수수료 추정치 (0.20%)
 EDGE_BUFFER_SLIPPAGE_PCT  = 0.10   # 슬리피지 여유 (0.10%)
 EDGE_MIN_NET_PCT          = 0.15   # 위 두 개 빼고도 최소 0.15% 이상 남아야 진입
@@ -117,10 +120,8 @@ CHAT_ID         = env("CHAT_ID")
 # GLOBAL STATE
 ###############################################################################
 
-# 현물/스팟 계정
-ex = {}
-# 선물/스왑 계정
-ex_fut = {}
+ex = {}      # 현물/스팟 계정
+ex_fut = {}  # 선물/스왑 계정
 
 TRADE_TIMES = []                     # 최근 1시간 트레이드 타임스탬프
 price_history = {"upbit": [], "bithumb": []}
@@ -170,7 +171,7 @@ def load_state():
                 STATE.update(data)
                 print(f"[STATE] Loaded from {STATE_FILE}: {STATE}")
         else:
-            today = datetime.utcnow().strftime("%Y-%m-%d")
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             STATE["date"] = today
             save_state()
     except Exception as e:
@@ -185,7 +186,7 @@ def save_state():
 
 def rollover_daily_pnl():
     """UTC 기준 날짜가 바뀌면 일일 실현손익을 리셋."""
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if STATE["date"] != today:
         print(f"[STATE] New day detected: {STATE['date']} -> {today}. Daily PnL reset.")
         STATE["date"] = today
@@ -514,16 +515,13 @@ def run_spread_arbitrage(symbol: str, tier1_thr: float, base_ratio: float, trade
             ex_sym = float(bal_k.get(symbol, {}).get("free", 0) or 0)
 
             def net_edge_ok(prem: float) -> bool:
-                """
-                prem: 김프(+) 또는 역프(-) % 값
-                """
                 if prem is None:
                     return False
                 gross = abs(prem)
                 needed = EDGE_BUFFER_FEE_PCT + EDGE_BUFFER_SLIPPAGE_PCT + EDGE_MIN_NET_PCT
                 return gross >= needed
 
-            # ─ SELL SIDE (김프, KRW 거래소가 더 비쌀 때) ─
+            # SELL SIDE (김프, KRW 거래소가 더 비쌀 때)
             if sell_prem is not None and can_trade_more(trade_times) and net_edge_ok(sell_prem):
                 trade_tier = None
                 trade_ratio = 0.0
@@ -563,7 +561,7 @@ def run_spread_arbitrage(symbol: str, tier1_thr: float, base_ratio: float, trade
                             f"amt={amt:.6f} net_pnl={int(net_pnl)} DRY_RUN={DRY_RUN}"
                         )
 
-            # ─ BUY SIDE (역프, KRW 거래소가 더 쌀 때) ─
+            # BUY SIDE (역프, KRW 거래소가 더 쌀 때)
             if buy_prem is not None and can_trade_more(trade_times) and net_edge_ok(buy_prem):
                 trade_tier = None
                 trade_ratio = 0.0
@@ -611,11 +609,6 @@ def run_spread_arbitrage(symbol: str, tier1_thr: float, base_ratio: float, trade
 ###############################################################################
 
 def run_krw_cross_arb(symbol: str):
-    """
-    업비트 vs 빗썸 BTC/ETH 가격 차이가 KRW_ARB_THR 이상이면
-    양쪽 거래소에서 동시에 사고 파는 KRW 차익거래.
-    순엣지(수수료+슬리피지 제외 후)가 남는 경우에만 진입.
-    """
     if disable_trading or not ENABLE_LAYER_KRW_CROSS:
         print(f"[KRW-ARB] trading disabled or layer off, skip {symbol}")
         return
@@ -710,36 +703,12 @@ def run_krw_cross_arb(symbol: str):
 ###############################################################################
 
 def funding_arbitrage_signals():
-    """
-    Binance USDT 선물 / Bybit swap / OKX swap의 BTC/USDT 펀딩 레이트를 비교.
-
-    - 새 포지션 진입 조건 (FUNDING_POS["active"] == False):
-      1) funding spread >= FUNDING_SPREAD_THR_OPEN
-      2) disable_trading == False
-      3) 두 선물 계좌에 USDT가 충분함 (FUNDING_MIN_NOTIONAL_USDT 이상)
-
-      → 고펀딩 거래소: 숏 (short)
-        저펀딩 거래소: 롱 (long)
-
-    - 기존 포지션 청산 조건 (FUNDING_POS["active"] == True):
-      1) 보유 시간 >= FUNDING_MAX_HOURS_HOLD
-         (FUNDING_TARGET_PAYMENTS * FUNDING_INTERVAL_HOURS)
-         OR
-      2) 현재 funding spread <= FUNDING_SPREAD_THR_CLOSE
-
-      → 기존 포지션의:
-        short_ex: buy (숏 청산)
-        long_ex : sell (롱 청산)
-
-    DRY_RUN=True일 때는 create_order 내부에서 실제 주문은 나가지 않고 로그만 찍는다.
-    """
     if not ENABLE_LAYER_FUNDING_SIG:
         return
 
     global FUNDING_POS
 
     try:
-        # 선물 인스턴스 체크
         if not ex_fut:
             print("[FUND] futures exchanges not initialized")
             return
@@ -777,7 +746,6 @@ def funding_arbitrage_signals():
         if len(rates) < 2:
             return
 
-        # 가장 높은/낮은 funding 찾기
         max_ex = max(rates, key=rates.get)
         min_ex = min(rates, key=rates.get)
         spread = rates[max_ex] - rates[min_ex]
@@ -789,21 +757,16 @@ def funding_arbitrage_signals():
 
         now = now_ts()
 
-        # ──────────────────────────────────────────────
-        # 1) 기존 포지션이 열려 있는 경우 → 청산 조건 체크
-        # ──────────────────────────────────────────────
+        # 1) 기존 포지션 청산 조건
         if FUNDING_POS["active"]:
             hold_hours = (now - FUNDING_POS["open_time"]) / 3600.0
             close_reason = None
 
-            # (A) 목표 펀딩 횟수만큼 보유했는지 (시간 기준)
             if hold_hours >= FUNDING_MAX_HOURS_HOLD:
                 close_reason = (
                     f"TIME: hold_hours={hold_hours:.2f}h "
                     f">= {FUNDING_MAX_HOURS_HOLD:.2f}h"
                 )
-
-            # (B) 스프레드가 충분히 줄었는지 (되돌림)
             elif spread <= FUNDING_SPREAD_THR_CLOSE:
                 close_reason = (
                     f"SPREAD: spread={spread:.5f} "
@@ -827,10 +790,8 @@ def funding_arbitrage_signals():
                     f"[FUND ARB CLOSE] reason={close_reason}, "
                     f"short={short_key}, long={long_key}, amt={amount:.4f}"
                 )
-                # 숏 청산: buy
-                create_order(short_ex, symbol, "buy", amount)
-                # 롱 청산: sell
-                create_order(long_ex,  symbol, "sell", amount)
+                create_order(short_ex, symbol, "buy", amount)  # 숏 청산
+                create_order(long_ex,  symbol, "sell", amount) # 롱 청산
 
                 msg = (
                     "[FUND ARB CLOSE]\n"
@@ -846,7 +807,6 @@ def funding_arbitrage_signals():
                 print(msg)
                 send_telegram(msg)
 
-                # 상태 초기화
                 FUNDING_POS["active"] = False
                 FUNDING_POS["short_ex"] = None
                 FUNDING_POS["long_ex"]  = None
@@ -854,22 +814,18 @@ def funding_arbitrage_signals():
                 FUNDING_POS["open_spread"] = 0.0
                 FUNDING_POS["open_time"]   = 0.0
 
-            return  # 포지션이 있었으면 여기서 종료
+            return
 
-        # ──────────────────────────────────────────────
-        # 2) 포지션이 없고, 새로 진입할지 여부 판단
-        # ──────────────────────────────────────────────
+        # 2) 새 포지션 진입 조건
         if disable_trading:
             print("[FUND] trading disabled, skip open")
             return
 
         if spread < FUNDING_SPREAD_THR_OPEN:
-            # 스프레드가 진입 기준보다 작으면 아무것도 안 함
             return
 
-        # 진입 후보 거래소
-        high_key = max_ex   # funding rate 높은 쪽 → 숏 후보
-        low_key  = min_ex   # funding rate 낮은 쪽 → 롱 후보
+        high_key = max_ex   # funding rate 높은 쪽 → 숏
+        low_key  = min_ex   # funding rate 낮은 쪽 → 롱
 
         high_ex = ex_fut.get(high_key)
         low_ex  = ex_fut.get(low_key)
@@ -879,14 +835,12 @@ def funding_arbitrage_signals():
 
         symbol = FUTURES_SYMBOL
 
-        # 가격
         t_high = safe_ticker(high_ex, symbol)
         t_low  = safe_ticker(low_ex, symbol)
         price_high = float(t_high["last"] or t_high["bid"])
         price_low  = float(t_low["last"] or t_low["bid"])
         mid_price  = (price_high + price_low) / 2.0
 
-        # USDT 잔고
         bal_high = high_ex.fetch_balance()
         bal_low  = low_ex.fetch_balance()
         free_high_usdt = float(bal_high.get("USDT", {}).get("free", 0) or 0)
@@ -897,7 +851,7 @@ def funding_arbitrage_signals():
             print(f"[FUND] not enough USDT for funding arb: {max_usable_usdt:.1f}")
             return
 
-        amount = max_usable_usdt / mid_price  # BTC 수량
+        amount = max_usable_usdt / mid_price
         if amount <= 0:
             return
 
@@ -906,7 +860,6 @@ def funding_arbitrage_signals():
             f"amt={amount:.4f} BTC, notional≈{max_usable_usdt:.1f} USDT, spread={spread:.5f}"
         )
 
-        # 고펀딩 거래소 숏, 저펀딩 거래소 롱
         create_order(high_ex, symbol, "sell", amount)  # short
         create_order(low_ex,  symbol, "buy",  amount)  # long
 
@@ -962,7 +915,7 @@ def main():
     global disable_trading
     load_state()
     init_exchanges()
-    send_telegram(f"공격형 김프봇 v2 시작 (DRY_RUN={DRY_RUN}) – Risk & PnL + Funding Arb")
+    send_telegram(f"공격형 김프봇 v2 시작 (DRY_RUN={DRY_RUN}) – 튜닝: 자본≈2.15억, 손실한도 2%")
 
     trade_times = []
 
