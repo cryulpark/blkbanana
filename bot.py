@@ -1,4 +1,8 @@
-import os, time, traceback, requests, csv
+import os
+import time
+import traceback
+import requests
+import csv
 from datetime import datetime
 import ccxt
 from ccxt.base.errors import AuthenticationError
@@ -20,7 +24,7 @@ BASE_RATIO_MIN = 0.3           # 최소 30%
 BASE_RATIO_MAX = 0.6           # 최대 60%
 
 # per-trade 최소 노치널 (KRW)
-MIN_NOTIONAL_KRW = 100000      # 10만 원 미만 거래는 무의미하므로 제외
+MIN_NOTIONAL_KRW = 100000      # 10만 원 미만 거래는 제외
 
 # 삼각차익 조건
 MIN_TRIANGULAR_SPREAD = 0.5    # 0.5% 이상일 때만 관심
@@ -29,11 +33,11 @@ MIN_TRIANGULAR_SPREAD = 0.5    # 0.5% 이상일 때만 관심
 MAX_TRADES_1H = 30
 
 # 일간 PnL 제한 (오늘 수익/손실)
-DAILY_TARGET_KRW = 200000      # 하루 20만 + 이상이면 그날 정지
-DAILY_STOP_KRW   = -80000      # 하루 -8만 손실이면 그날 정지
+DAILY_TARGET_KRW = 200000      # 하루 20만 이상 수익이면 정지
+DAILY_STOP_KRW   = -80000      # 하루 -8만 손실이면 정지
 
 # 1회 거래 최대 허용 손실(추정, KRW)
-MAX_LOSS_PER_TRADE = -20000    # 1회 거래에서 -2만 이상 나올 구조면 강제 스킵
+MAX_LOSS_PER_TRADE = -20000    # 1회 거래에서 -2만 이상 손해 가능성이면 강제 스킵
 
 # 변동성 기준 (%)
 VOL_THRESHOLD_BORDER = 10.0    # BTC/USDT 일간 변동성 10%를 기준으로 맵핑
@@ -64,23 +68,24 @@ def env(k: str) -> str:
         raise Exception(f"[ENV] Missing: {k}")
     return os.environ[k]
 
-BINANCE_API   = env("BINANCE_API_KEY")
-BINANCE_SECRET= env("BINANCE_SECRET")
+BINANCE_API     = env("BINANCE_API_KEY")
+BINANCE_SECRET  = env("BINANCE_SECRET")
 
-UPBIT_API     = env("UPBIT_API_KEY")
-UPBIT_SECRET  = env("UPBIT_SECRET")
+UPBIT_API       = env("UPBIT_API_KEY")
+UPBIT_SECRET    = env("UPBIT_SECRET")
 
-BITHUMB_API   = env("BITHUMB_API_KEY")
-BITHUMB_SECRET= env("BITHUMB_SECRET")
+BITHUMB_API     = env("BITHUMB_API_KEY")
+BITHUMB_SECRET  = env("BITHUMB_SECRET")
 
-BYBIT_API     = env("BYBIT_API_KEY")
-BYBIT_SECRET  = env("BYBIT_SECRET")
+BYBIT_API       = env("BYBIT_API_KEY")
+BYBIT_SECRET    = env("BYBIT_SECRET")
 
-OKX_API       = env("OKX_API_KEY")
-OKX_SECRET    = env("OKX_SECRET")
+OKX_API         = env("OKX_API_KEY")
+OKX_SECRET      = env("OKX_SECRET")
+OKX_PASSWORD    = env("OKX_PASSWORD")     # OKX Passphrase
 
-TELEGRAM_TOKEN= env("TELEGRAM_TOKEN")
-CHAT_ID       = env("CHAT_ID")
+TELEGRAM_TOKEN  = env("TELEGRAM_TOKEN")
+CHAT_ID         = env("CHAT_ID")
 
 ###############################################################################
 # GLOBAL STATE
@@ -91,6 +96,7 @@ TRADE_LOG = []                       # {ts,strategy,symbol,venue,direction,profi
 TRADE_TIMES = []                     # 최근 트레이드 timestamp
 last_status_time = time.time()
 last_daily_report_date = ""          # "YYYY-MM-DD"
+last_weekly_report_date = ""         # "YYYY-MM-DD" (월요일 9시 기준)
 disable_trading = False
 cumulative_profit_krw = 0.0
 last_rebalance_ts = 0.0
@@ -114,17 +120,29 @@ def send_telegram(msg: str):
 ###############################################################################
 
 def init_exchanges():
+    """
+    모든 거래소 초기화. OKX는 password(=passphrase)까지 설정.
+    """
     global exchanges
+
     config = [
-        ("binance", ccxt.binance,   BINANCE_API,   BINANCE_SECRET),
-        ("upbit",   ccxt.upbit,     UPBIT_API,     UPBIT_SECRET),
-        ("bithumb", ccxt.bithumb,   BITHUMB_API,   BITHUMB_SECRET),
-        ("bybit",   ccxt.bybit,     BYBIT_API,     BYBIT_SECRET),
-        ("okx",     ccxt.okx,       OKX_API,       OKX_SECRET),
+        ("binance", ccxt.binance,   BINANCE_API,   BINANCE_SECRET, None),
+        ("upbit",   ccxt.upbit,     UPBIT_API,     UPBIT_SECRET,   None),
+        ("bithumb", ccxt.bithumb,   BITHUMB_API,   BITHUMB_SECRET, None),
+        ("bybit",   ccxt.bybit,     BYBIT_API,     BYBIT_SECRET,   None),
+        ("okx",     ccxt.okx,       OKX_API,       OKX_SECRET,     OKX_PASSWORD),
     ]
-    for name, cls, key, sec in config:
+
+    for name, cls, key, sec, pwd in config:
         try:
-            inst = cls({"apiKey": key, "secret": sec, "enableRateLimit": True})
+            params = {
+                "apiKey": key,
+                "secret": sec,
+                "enableRateLimit": True,
+            }
+            if name == "okx":
+                params["password"] = pwd
+            inst = cls(params)
             inst.load_markets()
             exchanges[name] = inst
             print(f"[INIT] {name} 연결 성공")
@@ -350,7 +368,8 @@ def log_trade(strategy, symbol, venue, direction, profit_krw):
     })
 
 def today_date_str(ts=None):
-    if ts is None: ts = now_ts()
+    if ts is None:
+        ts = now_ts()
     lt = time.localtime(ts)
     return f"{lt.tm_year:04d}-{lt.tm_mon:02d}-{lt.tm_mday:02d}"
 
@@ -439,14 +458,14 @@ def snapshot_portfolio():
             rows.append(["upbit", v_krw])
 
         # Bithumb
-        bt = exchanges.get("bithumb")
-        if bt:
-            bal = bt.fetch_balance()
+        bh = exchanges.get("bithumb")
+        if bh:
+            bal = bh.fetch_balance()
             krw = float(bal.get("KRW", {}).get("free", 0.0) or 0.0)
             btc = float(bal.get("BTC", {}).get("free", 0.0) or 0.0)
             eth = float(bal.get("ETH", {}).get("free", 0.0) or 0.0)
-            t_btc = safe_ticker(bt, "BTC/KRW")
-            t_eth = safe_ticker(bt, "ETH/KRW")
+            t_btc = safe_ticker(bh, "BTC/KRW")
+            t_eth = safe_ticker(bh, "ETH/KRW")
             v_krw = krw + btc * float(t_btc["last"]) + eth * float(t_eth["last"])
             total_krw += v_krw
             rows.append(["bithumb", v_krw])
@@ -457,7 +476,6 @@ def snapshot_portfolio():
             if not inst:
                 continue
             bal = inst.fetch_balance()
-            # USDT 우선, 없으면 USD 시도
             usdt_info = bal.get("USDT") or bal.get("USD") or {}
             usdt_free = float(usdt_info.get("free", 0.0) or 0.0)
             if usdt_free > 0:
@@ -516,7 +534,6 @@ def arbitrage(symbol: str, threshold: float, ratio: float, trade_times):
                 print(f"[ARB] {venue} ticker fail: {e2}")
                 continue
 
-            # 실현 가능한 김프 계산
             test_amount = 0.01 if symbol == "BTC" else 0.05
             sp_data = realizable_premium(e, symbol, base_usdt, test_amount, usdt_krw, True)
             bp_data = realizable_premium(e, symbol, base_usdt, test_amount, usdt_krw, False)
@@ -579,7 +596,8 @@ def arbitrage(symbol: str, threshold: float, ratio: float, trade_times):
                     f"- cum={format_krw(cumulative_profit_krw)}\n"
                     f"- ratio={ratio:.2f} DRY_RUN={DRY_RUN}"
                 )
-                print(msg); send_telegram(msg)
+                print(msg)
+                send_telegram(msg)
 
             # BUY (KRW 거래소 싸게 살 때)
             if bp is not None and bp < -threshold:
@@ -623,7 +641,8 @@ def arbitrage(symbol: str, threshold: float, ratio: float, trade_times):
                     f"- cum={format_krw(cumulative_profit_krw)}\n"
                     f"- ratio={ratio:.2f} DRY_RUN={DRY_RUN}"
                 )
-                print(msg); send_telegram(msg)
+                print(msg)
+                send_telegram(msg)
 
         # 일간 손익 제한 체크
         today_pnl = compute_today_profit()
@@ -658,10 +677,8 @@ def triangular(name: str):
         print(f"[TRI ERR] {name} {e}")
 
 ###############################################################################
-# REPORTS
+# REPORTS: DAILY & WEEKLY
 ###############################################################################
-
-last_daily_report_date = ""    # 위에서 선언했지만, 함수에서 사용
 
 def send_daily_report_if_needed():
     global last_daily_report_date
@@ -678,7 +695,8 @@ def send_daily_report_if_needed():
 
     if not recent:
         msg = f"[DAILY] {cur}\n- 최근 24h 거래 없음\n- DRY_RUN={DRY_RUN}"
-        print(msg); send_telegram(msg)
+        print(msg)
+        send_telegram(msg)
         last_daily_report_date = cur
         return
 
@@ -695,10 +713,68 @@ def send_daily_report_if_needed():
         lines.append(f"· {sym} {st}: {format_krw(v['p'])} (거래 {v['c']}회)")
     lines.append(f"\n- DRY_RUN={DRY_RUN}")
     msg = "\n".join(lines)
-    print(msg); send_telegram(msg)
+    print(msg)
+    send_telegram(msg)
     last_daily_report_date = cur
 
-# 주간 리포트는 필요 시 비슷하게 추가 가능 (주 1회)
+def send_weekly_report_if_needed():
+    global last_weekly_report_date
+    lt = time.localtime()
+    cur = today_date_str()
+    # Monday(0) + 9시
+    if lt.tm_wday != 0 or lt.tm_hour != 9:
+        return
+    if last_weekly_report_date == cur:
+        return
+
+    now = now_ts()
+    cutoff = now - 7 * 86400
+    recent = [t for t in TRADE_LOG if t["ts"] >= cutoff]
+    if not recent:
+        msg = (
+            f"[WEEKLY] {cur}\n"
+            f"- 최근 7일 거래 없음\n"
+            f"- DRY_RUN={DRY_RUN}"
+        )
+        print(msg)
+        send_telegram(msg)
+        last_weekly_report_date = cur
+        return
+
+    total = sum(t["profit_krw"] for t in recent)
+    summary = {}
+    daily_map = {}
+    for t in recent:
+        day = today_date_str(t["ts"])
+        daily_map.setdefault(day, 0.0)
+        daily_map[day] += t["profit_krw"]
+
+        k = (t["strategy"], t["symbol"])
+        summary.setdefault(k, {"p": 0.0, "c": 0})
+        summary[k]["p"] += t["profit_krw"]
+        summary[k]["c"] += 1
+
+    best_day = max(daily_map.items(), key=lambda x: x[1])
+    worst_day = min(daily_map.items(), key=lambda x: x[1])
+
+    lines = []
+    lines.append(f"[WEEKLY] {cur} 기준 최근 7일 요약")
+    lines.append(f"- 7일 총 수익: {format_krw(total)}")
+    lines.append(f"- 일평균 수익: {format_krw(total / max(1, len(daily_map)))}")
+    lines.append("")
+    lines.append(f"- 최고 수익일: {best_day[0]} ({format_krw(best_day[1])})")
+    lines.append(f"- 최저 수익일: {worst_day[0]} ({format_krw(worst_day[1])})")
+    lines.append("")
+    lines.append("[전략별 수익]")
+    for (st, sym), v in summary.items():
+        lines.append(f"· {sym} {st}: {format_krw(v['p'])} (거래 {v['c']}회)")
+    lines.append("")
+    lines.append(f"- DRY_RUN={DRY_RUN}")
+
+    msg = "\n".join(lines)
+    print(msg)
+    send_telegram(msg)
+    last_weekly_report_date = cur
 
 ###############################################################################
 # REBALANCING
@@ -716,19 +792,18 @@ def rebalance_binance():
         if usdt + btc + eth == 0:
             return
 
-        usdt_rate = get_usdt_krw()
         t_btc = safe_ticker(b, "BTC/USDT")
         t_eth = safe_ticker(b, "ETH/USDT")
 
         v_usdt = usdt
         v_btc  = btc * float(t_btc["last"])
         v_eth  = eth * float(t_eth["last"])
-        total  = (v_usdt + v_btc + v_eth)
+        total  = v_usdt + v_btc + v_eth
 
         cur = {
             "BTC": v_btc / total,
             "ETH": v_eth / total,
-            "USDT": v_usdt / total
+            "USDT": v_usdt / total,
         }
         print(f"[REBAL BIN] cur={cur}")
 
@@ -736,22 +811,19 @@ def rebalance_binance():
         for k in ["BTC", "ETH", "USDT"]:
             diff = cur[k] - target[k]
             if abs(diff) > REBALANCE_DRIFT:
-                # 보정할 금액(USDT 기준)
-                adj = -diff * total * REBALANCE_STEP
+                adj_value = -diff * total * REBALANCE_STEP
                 if k == "BTC":
-                    # BTC 비율이 많으면 BTC 일부 매도
-                    amount = abs(adj) / float(t_btc["last"])
+                    price = float(t_btc["last"])
+                    amount = abs(adj_value) / price
                     side = "sell" if diff > 0 else "buy"
                     print(f"[REBAL BIN] {side.upper()} BTC {amount}")
                     create_market_order(b, "BTC/USDT", side, amount)
                 elif k == "ETH":
-                    amount = abs(adj) / float(t_eth["last"])
+                    price = float(t_eth["last"])
+                    amount = abs(adj_value) / price
                     side = "sell" if diff > 0 else "buy"
                     print(f"[REBAL BIN] {side.upper()} ETH {amount}")
                     create_market_order(b, "ETH/USDT", side, amount)
-                elif k == "USDT":
-                    # 여기서는 USDT 비율만 보고, BTC/ETH 쪽에서 이미 보정했으니 생략 가능
-                    pass
     except Exception as e:
         print(f"[REBAL BIN ERR] {e}")
 
@@ -786,26 +858,26 @@ def rebalance_krw_exchange(name: str):
         for k in ["KRW", "BTC", "ETH"]:
             diff = cur[k] - target[k]
             if abs(diff) > REBALANCE_DRIFT:
-                # 보정 금액(KRW 기준)
-                adj = -diff * total * REBALANCE_STEP
+                adj_value = -diff * total * REBALANCE_STEP
                 if k == "KRW":
-                    # KRW 비율이 너무 낮으면 BTC/ETH 매도해서 KRW 확보
-                    # 여기서는 BTC만 사용 (심플)
-                    if adj > 0:
-                        amount = adj / float(t_btc["last"])
-                        print(f"[REBAL {name}] SELL BTC {amount}")
-                        create_market_order(inst, "BTC/KRW", "sell", amount)
+                    if adj_value > 0:
+                        # KRW 늘려야 → BTC 매도
+                        price = float(t_btc["last"])
+                        amt = adj_value / price
+                        print(f"[REBAL {name}] SELL BTC {amt}")
+                        create_market_order(inst, "BTC/KRW", "sell", amt)
                 elif k == "BTC":
-                    # BTC 비율이 많으면 일부 매도, 적으면 일부 매수
-                    amount = abs(adj) / float(t_btc["last"])
+                    price = float(t_btc["last"])
+                    amt = abs(adj_value) / price
                     side = "sell" if diff > 0 else "buy"
-                    print(f"[REBAL {name}] {side.upper()} BTC {amount}")
-                    create_market_order(inst, "BTC/KRW", side, amount)
+                    print(f"[REBAL {name}] {side.upper()} BTC {amt}")
+                    create_market_order(inst, "BTC/KRW", side, amt)
                 elif k == "ETH":
-                    amount = abs(adj) / float(t_eth["last"])
+                    price = float(t_eth["last"])
+                    amt = abs(adj_value) / price
                     side = "sell" if diff > 0 else "buy"
-                    print(f"[REBAL {name}] {side.upper()} ETH {amount}")
-                    create_market_order(inst, "ETH/KRW", side, amount)
+                    print(f"[REBAL {name}] {side.upper()} ETH {amt}")
+                    create_market_order(inst, "ETH/KRW", side, amt)
     except Exception as e:
         print(f"[REBAL {name} ERR] {e}")
 
@@ -824,7 +896,7 @@ def main():
     global last_status_time, last_rebalance_ts, disable_trading
 
     init_exchanges()
-    send_telegram(f"김프봇 시작 (DRY_RUN={DRY_RUN}) – Realizable+Predict+Risk+Rebalance+CSV")
+    send_telegram(f"김프봇 시작 (DRY_RUN={DRY_RUN}) – Realizable+Predict+Risk+Rebalance+CSV+Weekly")
 
     trade_times = []
 
@@ -854,6 +926,7 @@ def main():
 
             # 리포트
             send_daily_report_if_needed()
+            send_weekly_report_if_needed()
 
             # 상태 리포트
             if now_ - last_status_time >= STATUS_INTERVAL:
@@ -865,7 +938,8 @@ def main():
                     f"- 최근 1h 거래횟수: {trades_last_hour(trade_times)}회\n"
                     f"- DRY_RUN={DRY_RUN}"
                 )
-                print(msg); send_telegram(msg)
+                print(msg)
+                send_telegram(msg)
                 last_status_time = now_
 
         except Exception as e:
