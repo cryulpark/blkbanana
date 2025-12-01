@@ -2,7 +2,7 @@ import os
 import time
 import json
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 import ccxt
 from ccxt.base.errors import AuthenticationError
 
@@ -13,9 +13,8 @@ from ccxt.base.errors import AuthenticationError
 DRY_RUN = True                 # 실매매 전에는 반드시 True 유지
 MAIN_LOOP_INTERVAL = 60        # 1분 루프
 
-# ─ 리스크 관리 ─
-# 전체 자본 ≒ 21,500,000원, 허용 손실 2% → 약 430,000원
-MAX_DAILY_LOSS_KRW = 430000    # 일일 허용 손실 한도
+# ─ 리스크 관리 (동적 2% 손실 한도) ─
+MAX_DAILY_LOSS_RATIO = 0.02    # "현재 자본의 2%"까지 일일 손실 허용 (복리 반영)
 STATE_FILE = "kimchi_bot_state.json"
 
 # ─ Layer ON/OFF ─
@@ -25,15 +24,12 @@ ENABLE_LAYER_FUNDING_SIG  = True   # 펀딩 아비트 (실제 포지션 + 자동
 ENABLE_LAYER_TRI_MONITOR  = True   # 삼각차익 모니터
 
 # ─ 기본 김프/역프 레이어 ─
-# Tier1: 굵은 김프 (강하게 진입)
 TIER1_THR_MIN = 1.2            # 변동성 낮을 때 최소 1.2%
-TIER1_THR_MAX = 1.6            # 변동성 높을 때 1.6%까지
+TIER1_THR_MAX = 1.6            # 변동성 높을 때 1.6%까지 (자동 보간)
 
-# Tier2: 얕은 김프 (소액 비중으로 진입)
-TIER2_THR = 0.7                # 0.7% 이상이면 Tier2 후보
+TIER2_THR = 0.7                # 0.7% 이상이면 Tier2 후보 (얕은 김프)
 
-# 기본 ratio (한 번에 잔고 몇 %까지 사용할지)
-# → 실매매 1단계: 30~60%로 완화 (기존 40~80%)
+# 자본 비율 (너 자본/리스크 기준 튜닝)
 BASE_RATIO_MIN = 0.3           # 최소 30%
 BASE_RATIO_MAX = 0.6           # 최대 60%
 TIER2_RATIO_FACTOR = 0.3       # Tier2는 기본 ratio의 30%만 사용
@@ -42,22 +38,21 @@ TIER2_RATIO_FACTOR = 0.3       # Tier2는 기본 ratio의 30%만 사용
 MIN_NOTIONAL_KRW = 50000       # 5만 미만은 거래 안 함
 
 # 1시간 거래 횟수 제한
-MAX_TRADES_1H = 30             # 공격형 50 → 30으로 완화
+MAX_TRADES_1H = 30             # 실매매 1단계: 1시간 최대 30회
 
 # ─ 업비트 ↔ 빗썸 KRW 차익 레이어 ─
-KRW_ARB_THR = 0.25             # 0.25% 이상이면 차익거래 후보 (net edge 필터로 추가 필터링)
-KRW_ARB_RATIO = 0.2            # 업빗/빗썸 사이 KRW 차익거래는 계좌의 20% 정도만
+KRW_ARB_THR = 0.25             # 명목 스프레드 0.25% 이상이면 후보
+KRW_ARB_RATIO = 0.2            # 업빗/빗썸 차익거래에 계좌의 20%까지 사용
 
 # ─ Funding 레이어(실제 포지션 진입 + 자동 청산) ─
 FUTURES_SYMBOL = "BTC/USDT:USDT"   # ccxt 통일 심볼 (Binance/Bybit/OKX USDT 선물)
 
-FUNDING_SPREAD_THR_OPEN  = 0.02    # 진입 기준: 스프레드 2% 이상일 때 진입 후보
-FUNDING_SPREAD_THR_CLOSE = 0.005   # 청산 기준: 스프레드가 0.5% 이하로 줄어들면 청산 후보
+FUNDING_SPREAD_THR_OPEN  = 0.02    # 진입 기준: 스프레드 2% 이상
+FUNDING_SPREAD_THR_CLOSE = 0.005   # 청산 기준: 스프레드 0.5% 이하
 
-# 선물 계좌는 대략 각 2,000 USDT 수준이므로, 10%만 사용 (≈ 200달러)
 FUNDING_ARB_RATIO            = 0.10    # 각 선물 계좌 USDT의 10% 사용
 FUNDING_MIN_NOTIONAL_USDT    = 100.0   # 100 USDT 미만이면 진입 안 함
-FUNDING_TARGET_PAYMENTS      = 3       # 목표 펀딩 횟수 (예: 3번 펀딩 받으면 청산)
+FUNDING_TARGET_PAYMENTS      = 3       # 목표 펀딩 횟수 (3번 펀딩 받으면 청산)
 FUNDING_INTERVAL_HOURS       = 8.0     # 펀딩 간격(보통 8시간)
 FUNDING_MAX_HOURS_HOLD       = FUNDING_TARGET_PAYMENTS * FUNDING_INTERVAL_HOURS
 
@@ -73,7 +68,7 @@ PREMIUM_PRED_WEIGHTS = {
 }
 
 # ─ 수수료 / 슬리피지 / 최소 순엣지 설정 ─
-# 기본 티어 추정치 (필요하면 나중에 정확한 값으로 조정 가능)
+# 기본 티어 가정 (필요시 조정)
 FEE_RATES = {
     "binance": 0.0004,     # 0.04%
     "upbit":   0.0005,     # 0.05%
@@ -128,12 +123,26 @@ price_history = {"upbit": [], "bithumb": []}
 
 disable_trading = False
 
+# 자본 추정 (동적 손실 한도용)
+LAST_EQUITY_KRW = 21500000.0   # 초기 추정치 (≈ 2,150만 원)
+
+# STATE: PnL/수수료/트레이드 + 일/주간 집계
 STATE = {
-    "date": None,                   # "YYYY-MM-DD" (UTC 기준)
-    "realized_pnl_krw": 0.0,
-    "realized_pnl_krw_daily": 0.0,
-    "fees_krw": 0.0,
-    "num_trades": 0,
+    "date": None,                   # "YYYY-MM-DD" (UTC 기준, 일간 구분용)
+
+    "realized_pnl_krw": 0.0,        # 누적 실현손익
+    "realized_pnl_krw_daily": 0.0,  # 당일 실현손익
+    "realized_pnl_krw_weekly": 0.0, # 주간 실현손익
+
+    "fees_krw": 0.0,                # 누적 수수료
+    "fees_krw_daily": 0.0,          # 당일 수수료
+    "fees_krw_weekly": 0.0,         # 주간 수수료
+
+    "num_trades": 0,                # 누적 트레이드 수
+    "num_trades_daily": 0,          # 당일 트레이드 수
+    "num_trades_weekly": 0,         # 주간 트레이드 수
+
+    "weekly_start_date": None,      # 주간 집계 시작일 (YYYY-MM-DD)
 }
 
 # 현재 열린 펀딩 아비트 포지션(1쌍만 운용)
@@ -162,17 +171,21 @@ def send_telegram(msg: str):
 # STATE PERSISTENCE
 ###############################################################################
 
+DEFAULT_STATE = STATE.copy()
+
 def load_state():
     global STATE
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                STATE.update(data)
-                print(f"[STATE] Loaded from {STATE_FILE}: {STATE}")
+            STATE = DEFAULT_STATE.copy()
+            STATE.update(data)
+            print(f"[STATE] Loaded from {STATE_FILE}: {STATE}")
         else:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             STATE["date"] = today
+            STATE["weekly_start_date"] = today
             save_state()
     except Exception as e:
         print(f"[STATE] load ERR {e}")
@@ -184,45 +197,215 @@ def save_state():
     except Exception as e:
         print(f"[STATE] save ERR {e}")
 
+###############################################################################
+# EQUITY ESTIMATION (동적 손실 한도용)
+###############################################################################
+
+def get_usdt_krw() -> float:
+    for name in ["upbit", "bithumb"]:
+        inst = ex.get(name)
+        if not inst:
+            continue
+        try:
+            t = safe_ticker(inst, "USDT/KRW")
+            return float(t["bid"])
+        except Exception as e2:
+            print(f"[FX] {name} USDT/KRW ERR {e2}")
+    print("[FX] 환율 실패 → 1350 사용")
+    return 1350.0
+
+def estimate_total_equity_krw() -> float:
+    """
+    현재 보유 자산(업비트/빗썸 KRW + BTC/ETH, 바이낸스/OKX/바이비트 USDT 등)을
+    대략 KRW로 환산. 손실 한도 계산용으로 쓰기 때문에,
+    약간 보수적으로 추정해도 괜찮다.
+    """
+    global LAST_EQUITY_KRW
+
+    try:
+        usdt_krw = get_usdt_krw()
+
+        # 기준 가격: 바이낸스 BTC/USDT, ETH/USDT
+        b = ex.get("binance")
+        if not b:
+            return LAST_EQUITY_KRW
+
+        t_btc = safe_ticker(b, "BTC/USDT")
+        t_eth = safe_ticker(b, "ETH/USDT")
+        btc_usdt = float(t_btc["last"])
+        eth_usdt = float(t_eth["last"])
+
+        total_krw = 0.0
+
+        # 업비트 / 빗썸: KRW + BTC + ETH
+        for name in ["upbit", "bithumb"]:
+            inst = ex.get(name)
+            if not inst:
+                continue
+            try:
+                bal = inst.fetch_balance()
+            except Exception as e:
+                print(f"[EQ] {name} balance ERR {e}")
+                continue
+
+            krw = float(bal.get("KRW", {}).get("total", 0) or 0)
+            btc = float(bal.get("BTC", {}).get("total", 0) or 0)
+            eth = float(bal.get("ETH", {}).get("total", 0) or 0)
+            total_krw += krw
+            total_krw += btc * btc_usdt * usdt_krw
+            total_krw += eth * eth_usdt * usdt_krw
+
+        # 바이낸스 spot: USDT + BTC + ETH
+        inst = ex.get("binance")
+        if inst:
+            try:
+                bal = inst.fetch_balance()
+                usdt = float(bal.get("USDT", {}).get("total", 0) or 0)
+                btc  = float(bal.get("BTC", {}).get("total", 0) or 0)
+                eth  = float(bal.get("ETH", {}).get("total", 0) or 0)
+                total_krw += usdt * usdt_krw
+                total_krw += btc * btc_usdt * usdt_krw
+                total_krw += eth * eth_usdt * usdt_krw
+            except Exception as e:
+                print(f"[EQ] binance balance ERR {e}")
+
+        # OKX spot: USDT만 (여기서는 USDT만 있다고 가정)
+        inst = ex.get("okx")
+        if inst:
+            try:
+                bal = inst.fetch_balance()
+                usdt = float(bal.get("USDT", {}).get("total", 0) or 0)
+                total_krw += usdt * usdt_krw
+            except Exception as e:
+                print(f"[EQ] okx balance ERR {e}")
+
+        # Bybit: USD/USDT (둘 다 USDT 비슷하게 처리)
+        inst = ex.get("bybit")
+        if inst:
+            try:
+                bal = inst.fetch_balance()
+                usdt = float(bal.get("USDT", {}).get("total", 0) or 0)
+                usd  = float(bal.get("USD",  {}).get("total", 0) or 0)
+                total_krw += (usdt + usd) * usdt_krw
+            except Exception as e:
+                print(f"[EQ] bybit balance ERR {e}")
+
+        # 너무 작게 나오면 fallback
+        if total_krw <= 0:
+            return LAST_EQUITY_KRW
+
+        LAST_EQUITY_KRW = total_krw
+        return total_krw
+
+    except Exception as e:
+        print(f"[EQ] estimate ERR {e}")
+        return LAST_EQUITY_KRW
+
+###############################################################################
+# DAILY / WEEKLY REPORTS
+###############################################################################
+
+def send_daily_report(prev_date: str, pnl: float, trades: int, fees: float):
+    msg = (
+        f"[DAILY REPORT {prev_date}]\n"
+        f"- 실현손익: {int(pnl)} KRW\n"
+        f"- 트레이드 수: {trades} 건\n"
+        f"- 수수료: {int(fees)} KRW\n"
+        f"- 누적 손익: {int(STATE['realized_pnl_krw'])} KRW\n"
+    )
+    print(msg)
+    send_telegram(msg)
+
+def send_weekly_report(start_date: str, end_date: str, pnl: float, trades: int, fees: float):
+    msg = (
+        f"[WEEKLY REPORT {start_date} ~ {end_date}]\n"
+        f"- 실현손익: {int(pnl)} KRW\n"
+        f"- 트레이드 수: {trades} 건\n"
+        f"- 수수료: {int(fees)} KRW\n"
+        f"- 누적 손익: {int(STATE['realized_pnl_krw'])} KRW\n"
+    )
+    print(msg)
+    send_telegram(msg)
+
 def rollover_daily_pnl():
-    """UTC 기준 날짜가 바뀌면 일일 실현손익을 리셋."""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if STATE["date"] != today:
-        print(f"[STATE] New day detected: {STATE['date']} -> {today}. Daily PnL reset.")
-        STATE["date"] = today
-        STATE["realized_pnl_krw_daily"] = 0.0
+    """
+    UTC 기준 날짜가 바뀌면:
+      1) 어제 일자를 기준으로 데일리 리포트 발송
+      2) 일일 PnL/수수료/트레이드 수 리셋
+      3) 주간 경과일 수 7일 이상이면 주간 리포트 발송 후 리셋
+    """
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    prev_date = STATE["date"]
+
+    if prev_date is None:
+        STATE["date"] = today_str
+        if STATE["weekly_start_date"] is None:
+            STATE["weekly_start_date"] = today_str
         save_state()
+        return
 
-def estimate_fee_krw(exchange_id: str, notional_krw: float) -> float:
-    rate = FEE_RATES.get(exchange_id, DEFAULT_FEE_RATE)
-    return notional_krw * rate
+    if prev_date == today_str:
+        return
 
-def update_pnl(trade_name: str, pnl_krw: float, fee_krw: float):
-    """
-    개별 트레이드의 net PnL과 fee를 상태에 반영하고, 리스크 한도 체크.
-    (펀딩 아비트는 여기 안 넣고, 현물/김프/크로스만 집계)
-    """
-    global disable_trading
-    STATE["realized_pnl_krw"] += pnl_krw
-    STATE["realized_pnl_krw_daily"] += pnl_krw
-    STATE["fees_krw"] += fee_krw
-    STATE["num_trades"] += 1
+    # 1) 어제에 대한 데일리 리포트
+    prev_pnl   = STATE["realized_pnl_krw_daily"]
+    prev_tr    = STATE["num_trades_daily"]
+    prev_fees  = STATE["fees_krw_daily"]
+    send_daily_report(prev_date, prev_pnl, prev_tr, prev_fees)
+
+    # 2) 일일 카운터 리셋
+    STATE["realized_pnl_krw_daily"] = 0.0
+    STATE["fees_krw_daily"] = 0.0
+    STATE["num_trades_daily"] = 0
+
+    # 3) 주간 리포트 체크
+    if STATE["weekly_start_date"] is None:
+        STATE["weekly_start_date"] = prev_date
+
+    try:
+        ws = date.fromisoformat(STATE["weekly_start_date"])
+        pe = date.fromisoformat(prev_date)   # week end = 어제
+        days_diff = (pe - ws).days
+    except Exception:
+        ws = pe = None
+        days_diff = 0
+
+    if days_diff >= 6:  # 7일(0~6) 이상 경과
+        weekly_pnl   = STATE["realized_pnl_krw_weekly"]
+        weekly_tr    = STATE["num_trades_weekly"]
+        weekly_fees  = STATE["fees_krw_weekly"]
+        send_weekly_report(STATE["weekly_start_date"], prev_date, weekly_pnl, weekly_tr, weekly_fees)
+
+        # 주간 카운터 리셋
+        STATE["realized_pnl_krw_weekly"] = 0.0
+        STATE["fees_krw_weekly"] = 0.0
+        STATE["num_trades_weekly"] = 0
+        STATE["weekly_start_date"] = today_str
+
+    # 날짜 업데이트
+    STATE["date"] = today_str
     save_state()
 
-    print(
-        f"[PNL] {trade_name} pnl={pnl_krw:.0f} krw fee={fee_krw:.0f} krw "
-        f"day_pnl={STATE['realized_pnl_krw_daily']:.0f} total={STATE['realized_pnl_krw']:.0f}"
-    )
+###############################################################################
+# FX / VOL / SPEED
+###############################################################################
 
-    # 일일 손실 한도 체크
-    if STATE["realized_pnl_krw_daily"] <= -MAX_DAILY_LOSS_KRW and not disable_trading:
-        disable_trading = True
-        msg = (
-            f"[RISK] 일일 손실 한도 초과: {STATE['realized_pnl_krw_daily']:.0f} krw "
-            f"<= -{MAX_DAILY_LOSS_KRW}. 자동 매매 중단."
-        )
-        print(msg)
-        send_telegram(msg)
+def get_usdt_krw_fx() -> float:
+    # wrapper: 위에 get_usdt_krw와 동일
+    return get_usdt_krw()
+
+def get_daily_volatility() -> float:
+    try:
+        b = ex["binance"]
+        ohlcv = b.fetch_ohlcv("BTC/USDT", "1d", limit=2)
+        if len(ohlcv) < 2:
+            return 0.0
+        p0 = ohlcv[0][4]
+        p1 = ohlcv[1][4]
+        return abs((p1 - p0) / p0 * 100)
+    except Exception as e:
+        print(f"[VOL] ERR {e}")
+        return 0.0
 
 ###############################################################################
 # EXCHANGE INIT
@@ -233,7 +416,6 @@ def init_exchanges():
     ex = {}
     ex_fut = {}
 
-    # Spot / 일반 계정
     spot_config = [
         ("binance", ccxt.binance,   BINANCE_API,   BINANCE_SECRET, None),
         ("upbit",   ccxt.upbit,     UPBIT_API,     UPBIT_SECRET,   None),
@@ -319,36 +501,6 @@ def safe_orderbook(e, symbol: str, depth: int = 10):
         print(f"[OB] {e.id} {symbol} ERR {str(e2)[:80]}")
         return None
 
-###############################################################################
-# FX / VOL / SPEED
-###############################################################################
-
-def get_usdt_krw() -> float:
-    for name in ["upbit", "bithumb"]:
-        inst = ex.get(name)
-        if not inst:
-            continue
-        try:
-            t = safe_ticker(inst, "USDT/KRW")
-            return float(t["bid"])
-        except Exception as e2:
-            print(f"[FX] {name} USDT/KRW ERR {e2}")
-    print("[FX] 환율 실패 → 1350 사용")
-    return 1350.0
-
-def get_daily_volatility() -> float:
-    try:
-        b = ex["binance"]
-        ohlcv = b.fetch_ohlcv("BTC/USDT", "1d", limit=2)
-        if len(ohlcv) < 2:
-            return 0.0
-        p0 = ohlcv[0][4]
-        p1 = ohlcv[1][4]
-        return abs((p1 - p0) / p0 * 100)
-    except Exception as e:
-        print(f"[VOL] ERR {e}")
-        return 0.0
-
 def record_price(source: str, price: float):
     ph = price_history[source]
     ph.append(price)
@@ -411,7 +563,6 @@ def calc_vwap(ob, amount: float, is_buy: bool):
 def auto_tier1_params(vol: float, trade_times) -> (float, float):
     tc = len([t for t in trade_times if now_ts() - t <= 3600])
     v = min(max(vol, 0.0), VOL_THRESHOLD_BORDER)
-    # threshold
     if VOL_THRESHOLD_BORDER > 0:
         thr = TIER1_THR_MIN + (TIER1_THR_MAX - TIER1_THR_MIN) * (v / VOL_THRESHOLD_BORDER)
     else:
@@ -421,7 +572,7 @@ def auto_tier1_params(vol: float, trade_times) -> (float, float):
     if tc > MAX_TRADES_1H * 0.7:
         thr += 0.3
     thr = max(1.0, min(2.0, thr))
-    # ratio
+
     base_ratio = 0.5
     vol_factor = v / VOL_THRESHOLD_BORDER if VOL_THRESHOLD_BORDER > 0 else 1.0
     base_ratio -= vol_factor * 0.1
@@ -448,6 +599,55 @@ def can_trade_more(trade_times):
     return len(recent) < MAX_TRADES_1H
 
 ###############################################################################
+# PnL UPDATE (동적 2% 손실 한도 + 일/주간 카운터)
+###############################################################################
+
+def estimate_fee_krw(exchange_id: str, notional_krw: float) -> float:
+    rate = FEE_RATES.get(exchange_id, DEFAULT_FEE_RATE)
+    return notional_krw * rate
+
+def update_pnl(trade_name: str, pnl_krw: float, fee_krw: float):
+    """
+    개별 트레이드 net PnL/fee를 누적 + 일/주간 카운터 업데이트
+    그리고 "현재 자본의 2% 이상 손실"이면 매매 중단.
+    """
+    global disable_trading
+
+    STATE["realized_pnl_krw"] += pnl_krw
+    STATE["realized_pnl_krw_daily"] += pnl_krw
+    STATE["realized_pnl_krw_weekly"] += pnl_krw
+
+    STATE["fees_krw"] += fee_krw
+    STATE["fees_krw_daily"] += fee_krw
+    STATE["fees_krw_weekly"] += fee_krw
+
+    STATE["num_trades"] += 1
+    STATE["num_trades_daily"] += 1
+    STATE["num_trades_weekly"] += 1
+
+    save_state()
+
+    print(
+        f"[PNL] {trade_name} pnl={pnl_krw:.0f} krw fee={fee_krw:.0f} krw "
+        f"day_pnl={STATE['realized_pnl_krw_daily']:.0f} "
+        f"week_pnl={STATE['realized_pnl_krw_weekly']:.0f} "
+        f"total={STATE['realized_pnl_krw']:.0f}"
+    )
+
+    # 동적 2% 손실 한도 체크
+    equity_krw = estimate_total_equity_krw()
+    loss_limit = equity_krw * MAX_DAILY_LOSS_RATIO
+    if STATE["realized_pnl_krw_daily"] <= -loss_limit and not disable_trading:
+        disable_trading = True
+        msg = (
+            f"[RISK] 동적 손실 한도 초과: 일일 PnL={STATE['realized_pnl_krw_daily']:.0f} krw "
+            f"<= -{int(loss_limit)} (자본 {int(equity_krw)}의 {MAX_DAILY_LOSS_RATIO*100:.1f}%)\n"
+            f"→ 자동 매매 중단."
+        )
+        print(msg)
+        send_telegram(msg)
+
+###############################################################################
 # LAYER 1: 김프/역프 재정거래 (TIER1 + TIER2)
 ###############################################################################
 
@@ -459,7 +659,7 @@ def run_spread_arbitrage(symbol: str, tier1_thr: float, base_ratio: float, trade
 
     try:
         b = ex["binance"]
-        usdt_krw = get_usdt_krw()
+        usdt_krw = get_usdt_krw_fx()
         base_pair = f"{symbol}/USDT"
         t_base = safe_ticker(b, base_pair)
         base_usdt = float(t_base["bid"])
@@ -651,7 +851,6 @@ def run_krw_cross_arb(symbol: str):
             return
 
         if prem > 0:
-            # upbit 비쌈 → upbit SELL, bithumb BUY
             amt = max_notional / price_u
             amt = min(amt, free_u_sym * 0.9, (free_b_krw * 0.9) / price_b)
             if amt <= 0:
@@ -673,7 +872,6 @@ def run_krw_cross_arb(symbol: str):
                 f"amt={amt:.5f} net_pnl={int(net_pnl)} DRY_RUN={DRY_RUN}"
             )
         else:
-            # prem < 0 → 빗썸 비쌈 → 빗썸 SELL, 업비트 BUY
             amt = max_notional / price_b
             amt = min(amt, free_b_sym * 0.9, (free_u_krw * 0.9) / price_u)
             if amt <= 0:
@@ -790,8 +988,8 @@ def funding_arbitrage_signals():
                     f"[FUND ARB CLOSE] reason={close_reason}, "
                     f"short={short_key}, long={long_key}, amt={amount:.4f}"
                 )
-                create_order(short_ex, symbol, "buy", amount)  # 숏 청산
-                create_order(long_ex,  symbol, "sell", amount) # 롱 청산
+                create_order(short_ex, symbol, "buy", amount)   # 숏 청산
+                create_order(long_ex,  symbol, "sell", amount)  # 롱 청산
 
                 msg = (
                     "[FUND ARB CLOSE]\n"
@@ -915,7 +1113,15 @@ def main():
     global disable_trading
     load_state()
     init_exchanges()
-    send_telegram(f"공격형 김프봇 v2 시작 (DRY_RUN={DRY_RUN}) – 튜닝: 자본≈2.15억, 손실한도 2%")
+    equity_krw = estimate_total_equity_krw()
+    msg = (
+        f"공격형 김프봇 v2 시작 (DRY_RUN={DRY_RUN})\n"
+        f"- 추정 자본: 약 {int(equity_krw):,} KRW\n"
+        f"- 일일 손실 한도: 자본의 {MAX_DAILY_LOSS_RATIO*100:.1f}% (동적 적용)\n"
+        f"- 일일/주간 리포트 자동 발송"
+    )
+    print(msg)
+    send_telegram(msg)
 
     trade_times = []
 
