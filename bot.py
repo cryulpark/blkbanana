@@ -1,18 +1,18 @@
-import os, time, json, requests
+import os, time, json, requests, csv
 from datetime import datetime, timezone, date
 import ccxt
 from ccxt.base.errors import AuthenticationError
 
 ###############################################################################
-# SETTINGS (극공격 테스트용: 월 수익 극대화 시도 / 리스크 ↑)
+# SETTINGS (안정형 성장: 월 3~7% 목표)
 ###############################################################################
 
-# ⚠ 반드시 DRY_RUN 상태에서 충분히 테스트 후 실계정에 적용하세요.
+# ⚠ 실제 운영 전까지 DRY_RUN=True 상태에서 충분히 테스트 필수
 DRY_RUN = True
-MAIN_LOOP_INTERVAL = 20   # 더 공격적으로 자주 체크 (기존 60초 → 20초)
+MAIN_LOOP_INTERVAL = 45   # 45초마다 한 번 루프 (HFT처럼 안 보이게)
 
-# 동적 일일 손실 한도: "현재 자본의 10%" (공격형)
-MAX_DAILY_LOSS_RATIO = 0.10
+# 동적 일일 손실 한도: "현재 자본의 3%" (손실 최소화)
+MAX_DAILY_LOSS_RATIO = 0.03
 STATE_FILE = "kimchi_bot_state.json"
 
 # 레이어 ON/OFF
@@ -21,36 +21,36 @@ ENABLE_LAYER_KRW_CROSS    = True
 ENABLE_LAYER_FUNDING_SIG  = True
 ENABLE_LAYER_TRI_MONITOR  = True
 
-# 김프/역프 (극공격형)
-# - Tier1 문턱 낮춤: 0.6~1.0%
-# - Tier2: 0.3% 이상도 진입
-TIER1_THR_MIN = 0.6      # Tier1: 0.6~1.0% 김프
-TIER1_THR_MAX = 1.0
-TIER2_THR     = 0.3      # Tier2: 0.3% 이상
+# 김프/역프 (안정형 성장)
+# - Tier1: 0.8~1.2% 근처에서 진입
+# - Tier2: 0.5% 이상에서 소량 진입
+TIER1_THR_MIN = 0.8
+TIER1_THR_MAX = 1.2
+TIER2_THR     = 0.5
 
-# 자본 비율 (극공격형)
-# - 기본 진입 비중 60~90%
-# - Tier2도 50% 정도 비중
-BASE_RATIO_MIN = 0.6     # 한 번 진입에 60~90%
-BASE_RATIO_MAX = 0.9
-TIER2_RATIO_FACTOR = 0.5
+# 자본 비율 (안정형 성장)
+# - 기본 진입 비중: 35~60%
+# - Tier2는 기본 비중의 35%만
+BASE_RATIO_MIN = 0.35
+BASE_RATIO_MAX = 0.60
+TIER2_RATIO_FACTOR = 0.35
 
-# 최소 노출/트레이드 제한 (극공격형)
-MIN_NOTIONAL_KRW = 30000   # 3만원 이상이면 진입 (기존 5만원)
-MAX_TRADES_1H = 120        # 시간당 최대 120트레이드까지 허용 (기존 40)
+# 최소/최대 익스포저 (실제 체결 안정성용)
+MIN_NOTIONAL_KRW = 60000     # 6만원 이상일 때만 진입
+MAX_TRADES_1H = 35           # 시간당 35트레이드 제한 (과한 HFT 방지)
 
-# 업↔빗 KRW 차익 (극공격형)
-# - 스프레드 문턱 낮춤: 0.18 → 0.08
-# - 자본 사용 비율: 20% → 50%
-KRW_ARB_THR   = 0.08
-KRW_ARB_RATIO = 0.5
+# 업↔빗 KRW 차익 (안정형 성장)
+# - 0.12% 이상 차이에서만 진입
+# - 자본의 25%까지 사용
+KRW_ARB_THR   = 0.12
+KRW_ARB_RATIO = 0.25
 
-# 펀딩 아비트 (극공격형)
+# 펀딩 아비트 (안정형 성장)
 FUTURES_SYMBOL          = "BTC/USDT:USDT"
-FUNDING_SPREAD_THR_OPEN = 0.010   # 1.0% 이상 진입 (기존 1.5%)
-FUNDING_SPREAD_THR_CLOSE= 0.002   # 0.2% 이하 청산 (기존 0.4%)
-FUNDING_ARB_RATIO       = 0.20    # 각 선물계좌 20% 사용 (기존 10%)
-FUNDING_MIN_NOTIONAL_USDT = 50.0  # 최소 50 USDT (기존 100)
+FUNDING_SPREAD_THR_OPEN = 0.008   # 0.8% 이상 스프레드에서 진입
+FUNDING_SPREAD_THR_CLOSE= 0.003   # 0.3% 이하로 좁혀지면 청산
+FUNDING_ARB_RATIO       = 0.12    # 각 선물 계좌의 12% 사용
+FUNDING_MIN_NOTIONAL_USDT = 80.0  # 최소 80 USDT 정도부터
 FUNDING_TARGET_PAYMENTS = 3
 FUNDING_INTERVAL_HOURS  = 8.0
 FUNDING_MAX_HOURS_HOLD  = FUNDING_TARGET_PAYMENTS * FUNDING_INTERVAL_HOURS
@@ -66,8 +66,8 @@ PREMIUM_PRED_WEIGHTS = {
     "orderbook_imbalance": 0.2,
 }
 
-# 수수료/슬리피지/최소 순엣지 (극공격형)
-# - 총 요구 gross edge를 0.40% → 0.25% 수준으로 완화
+# 수수료/슬리피지/최소 순엣지 (안정형 성장)
+# 대략 총 gross 프리미엄이 0.25% 이상일 때만 진입하도록 설계
 FEE_RATES = {
     "binance": 0.0004,
     "upbit":   0.0005,
@@ -76,9 +76,12 @@ FEE_RATES = {
     "okx":     0.0005,
 }
 DEFAULT_FEE_RATE          = 0.0005
-EDGE_BUFFER_FEE_PCT       = 0.15   # 수수료 여유 버퍼
-EDGE_BUFFER_SLIPPAGE_PCT  = 0.05   # 슬리피지 버퍼
-EDGE_MIN_NET_PCT          = 0.05   # 최소 순엣지 0.05%
+EDGE_BUFFER_FEE_PCT       = 0.12   # 수수료 여유 버퍼 (12bp)
+EDGE_BUFFER_SLIPPAGE_PCT  = 0.05   # 슬리피지 버퍼 (5bp)
+EDGE_MIN_NET_PCT          = 0.08   # 기대 순엣지 최소 0.08% (8bp)
+
+# 트레이드 로그 파일
+TRADE_LOG_FILE = "kimchi_bot_trades.csv"
 
 ###############################################################################
 # ENV
@@ -111,7 +114,7 @@ ex, ex_fut = {}, {}
 TRADE_TIMES = []
 price_history = {"upbit": [], "bithumb": []}
 disable_trading = False
-LAST_EQUITY_KRW = 21500000.0   # 초기 추정치 (≈ 2,150만 원)
+LAST_EQUITY_KRW = 21500000.0   # 초기 추정치 (원하는 값으로 수정 가능)
 
 STATE = {
     "date": None,  # "YYYY-MM-DD" UTC
@@ -138,7 +141,7 @@ FUNDING_POS = {
 }
 
 ###############################################################################
-# TELEGRAM / STATE
+# TELEGRAM / STATE / TRADE LOG
 ###############################################################################
 
 def send_telegram(msg: str):
@@ -173,6 +176,61 @@ def load_state():
             save_state()
     except Exception as e:
         print(f"[STATE] load ERR {e}")
+
+def init_trade_log():
+    """트레이드 로그 CSV가 없으면 헤더 생성"""
+    if not os.path.exists(TRADE_LOG_FILE):
+        try:
+            with open(TRADE_LOG_FILE, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow([
+                    "ts",           # timestamp (float)
+                    "date_utc",     # UTC 날짜/시간
+                    "layer",        # SPREAD_ARB / KRW_ARB / FUNDING_ARB 등
+                    "symbol",       # BTC, ETH ...
+                    "venue",        # upbit, bithumb, binance 등
+                    "side",         # 전략 방향 설명
+                    "tier",         # TIER1 / TIER2 / NONE
+                    "prem_pct",     # 당시 프리미엄 (%)
+                    "notional_krw", # 대략적인 노출 금액 (KRW)
+                    "amount",       # 코인 수량
+                    "gross_pnl_krw",# 수수료 제외한 이론상 PnL
+                    "fee_krw",      # 추정 수수료 합
+                    "net_pnl_krw",  # 추정 순이익
+                    "dry_run",      # DRY_RUN 여부
+                ])
+            print(f"[TRADE LOG] Created {TRADE_LOG_FILE}")
+        except Exception as e:
+            print(f"[TRADE LOG INIT ERR] {e}")
+
+def log_trade(layer, symbol, venue, side, tier,
+              prem_pct, notional_krw, amount,
+              gross_pnl_krw, fee_krw, net_pnl_krw):
+    """각 트레이드를 CSV로 한 줄씩 기록"""
+    ts = time.time()
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    row = [
+        f"{ts:.3f}",
+        dt,
+        layer,
+        symbol,
+        venue,
+        side,
+        tier if tier is not None else "",
+        f"{prem_pct:.6f}" if prem_pct is not None else "",
+        int(notional_krw) if notional_krw is not None else "",
+        f"{amount:.8f}" if amount is not None else "",
+        f"{gross_pnl_krw:.0f}" if gross_pnl_krw is not None else "",
+        f"{fee_krw:.0f}" if fee_krw is not None else "",
+        f"{net_pnl_krw:.0f}" if net_pnl_krw is not None else "",
+        str(DRY_RUN),
+    ]
+    try:
+        with open(TRADE_LOG_FILE, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(row)
+    except Exception as e:
+        print(f"[TRADE LOG ERR] {e}")
 
 ###############################################################################
 # FX / EQUITY
@@ -355,19 +413,24 @@ def calc_vwap(ob, amount: float, is_buy: bool):
     return cost / amount
 
 def auto_tier1_params(vol: float, trade_times):
+    """변동성과 최근 트레이드 수를 고려해 TIER1 임계값/비중 자동 조정"""
     tc = len([t for t in trade_times if now_ts() - t <= 3600])
     v = min(max(vol, 0.0), VOL_THRESHOLD_BORDER)
-    thr = TIER1_THR_MAX if VOL_THRESHOLD_BORDER <= 0 else TIER1_THR_MIN + (TIER1_THR_MAX - TIER1_THR_MIN) * (v / VOL_THRESHOLD_BORDER)
+    # 변동성 높을수록 TIER1 문턱을 살짝 올려서 과도한 진입 방지
+    thr = TIER1_THR_MIN + (TIER1_THR_MAX - TIER1_THR_MIN) * (v / VOL_THRESHOLD_BORDER)
     prob = predict_premium_prob(vol)
-    thr -= prob * 0.3
+    # 프리미엄 확률이 높으면 약간 문턱을 낮춤
+    thr -= prob * 0.2
+    # 시간당 트레이드가 많아지면 다시 문턱을 올림
     if tc > MAX_TRADES_1H * 0.7:
-        thr += 0.3
-    thr = max(0.4, min(2.0, thr))  # 극공격: 하한 0.4%까지 허용
+        thr += 0.2
+    # 하한 0.6% ~ 상한 2.0% 사이에서 클램프
+    thr = max(0.6, min(2.0, thr))
 
-    base_ratio = 0.7  # 기본값을 약간 높게
+    base_ratio = 0.45  # 기본값
     vol_factor = v / VOL_THRESHOLD_BORDER if VOL_THRESHOLD_BORDER > 0 else 1.0
-    base_ratio -= vol_factor * 0.1
-    base_ratio += prob * 0.1
+    base_ratio -= vol_factor * 0.05   # 변동성 높을수록 비중 살짝 줄임
+    base_ratio += prob * 0.10         # 프리미엄 확률 높을수록 비중 조금 올림
     base_ratio = max(BASE_RATIO_MIN, min(BASE_RATIO_MAX, base_ratio))
     return thr, base_ratio
 
@@ -462,7 +525,7 @@ def rollover_daily_pnl():
     save_state()
 
 def update_pnl(trade_name: str, pnl_krw: float, fee_krw: float):
-    """PnL/수수료/트레이드 누적 + 일/주간 업데이트 + 동적 10% 손실 한도 체크"""
+    """PnL/수수료/트레이드 누적 + 일/주간 업데이트 + 동적 3% 손실 한도 체크"""
     global disable_trading
     STATE["realized_pnl_krw"]        += pnl_krw
     STATE["realized_pnl_krw_daily"]  += pnl_krw
@@ -487,7 +550,7 @@ def update_pnl(trade_name: str, pnl_krw: float, fee_krw: float):
     if STATE["realized_pnl_krw_daily"] <= -loss_limit and not disable_trading:
         disable_trading = True
         msg = (
-            f"[RISK] 일일 손실 한도 초과(극공격 모드): PnL={STATE['realized_pnl_krw_daily']:.0f} krw "
+            f"[RISK] 일일 손실 한도 초과(안정형 모드): PnL={STATE['realized_pnl_krw_daily']:.0f} krw "
             f"<= -{int(loss_limit)} (자본 {int(equity_krw)}의 {MAX_DAILY_LOSS_RATIO*100:.1f}%)\n"
             f"→ 자동 매매 중단."
         )
@@ -641,6 +704,22 @@ def run_spread_arbitrage(symbol: str, tier1_thr: float, base_ratio: float, trade
                         create_order(b,base_pair,"buy",amt)
                         create_order(e,f"{symbol}/KRW","sell",amt)
                         trade_times.append(now_ts())
+
+                        # 로그 기록
+                        log_trade(
+                            layer="SPREAD_ARB",
+                            symbol=symbol,
+                            venue=venue,
+                            side="KRW_SELL_BIN_BUY",
+                            tier=trade_tier,
+                            prem_pct=sell_prem,
+                            notional_krw=notional_krw,
+                            amount=amt,
+                            gross_pnl_krw=gross_pnl,
+                            fee_krw=total_fee,
+                            net_pnl_krw=net_pnl,
+                        )
+
                         update_pnl(f"{symbol}-{venue}-SELL-{trade_tier}", net_pnl, total_fee)
                         send_telegram(f"[{symbol}] {venue} SELL {trade_tier} prem={sell_prem:.2f}% amt={amt:.6f} net_pnl={int(net_pnl)} DRY_RUN={DRY_RUN}")
 
@@ -670,6 +749,22 @@ def run_spread_arbitrage(symbol: str, tier1_thr: float, base_ratio: float, trade
                         create_order(e,f"{symbol}/KRW","buy",amt)
                         create_order(b,base_pair,"sell",amt)
                         trade_times.append(now_ts())
+
+                        # 로그 기록
+                        log_trade(
+                            layer="SPREAD_ARB",
+                            symbol=symbol,
+                            venue=venue,
+                            side="KRW_BUY_BIN_SELL",
+                            tier=trade_tier,
+                            prem_pct=buy_prem,
+                            notional_krw=notional_krw,
+                            amount=amt,
+                            gross_pnl_krw=gross_pnl,
+                            fee_krw=total_fee,
+                            net_pnl_krw=net_pnl,
+                        )
+
                         update_pnl(f"{symbol}-{venue}-BUY-{trade_tier}", net_pnl, total_fee)
                         send_telegram(f"[{symbol}] {venue} BUY {trade_tier} prem={buy_prem:.2f}% amt={amt:.6f} net_pnl={int(net_pnl)} DRY_RUN={DRY_RUN}")
     except Exception as e:
@@ -704,6 +799,7 @@ def run_krw_cross_arb(symbol: str):
         )
         if max_notional < MIN_NOTIONAL_KRW: return
 
+        # 업비트 고가, 빗썸 저가 → 업비트 SELL, 빗썸 BUY
         if prem > 0:
             amt = max_notional / price_u
             amt = min(amt, free_u_sym*0.9, (free_b_krw*0.9)/price_b)
@@ -718,8 +814,25 @@ def run_krw_cross_arb(symbol: str):
             print(f"[KRW-ARB {symbol}] upbit SELL, bithumb BUY amt={amt} net_pnl={net_pnl:.0f}")
             create_order(u,f"{symbol}/KRW","sell",amt)
             create_order(b,f"{symbol}/KRW","buy",amt)
+
+            # 로그 기록
+            log_trade(
+                layer="KRW_ARB",
+                symbol=symbol,
+                venue="upbit_bithumb",
+                side="UP_SELL_BT_BUY",
+                tier="NONE",
+                prem_pct=prem,
+                notional_krw=max_notional,
+                amount=amt,
+                gross_pnl_krw=gross_pnl,
+                fee_krw=total_fee,
+                net_pnl_krw=net_pnl,
+            )
+
             update_pnl(f"{symbol}-KRW-ARB-up-sell", net_pnl, total_fee)
             send_telegram(f"[KRW ARB {symbol}] upbit SELL / bithumb BUY prem={prem:.3f}% amt={amt:.5f} net_pnl={int(net_pnl)} DRY_RUN={DRY_RUN}")
+        # 빗썸 고가, 업비트 저가 → 빗썸 SELL, 업비트 BUY
         else:
             amt = max_notional / price_b
             amt = min(amt, free_b_sym*0.9, (free_u_krw*0.9)/price_u)
@@ -734,6 +847,22 @@ def run_krw_cross_arb(symbol: str):
             print(f"[KRW-ARB {symbol}] bithumb SELL, upbit BUY amt={amt} net_pnl={net_pnl:.0f}")
             create_order(b,f"{symbol}/KRW","sell",amt)
             create_order(u,f"{symbol}/KRW","buy",amt)
+
+            # 로그 기록
+            log_trade(
+                layer="KRW_ARB",
+                symbol=symbol,
+                venue="bithumb_upbit",
+                side="BT_SELL_UP_BUY",
+                tier="NONE",
+                prem_pct=prem,
+                notional_krw=max_notional,
+                amount=amt,
+                gross_pnl_krw=gross_pnl,
+                fee_krw=total_fee,
+                net_pnl_krw=net_pnl,
+            )
+
             update_pnl(f"{symbol}-KRW-ARB-bt-sell", net_pnl, total_fee)
             send_telegram(f"[KRW ARB {symbol}] bithumb SELL / upbit BUY prem={prem:.3f}% amt={amt:.5f} net_pnl={int(net_pnl)} DRY_RUN={DRY_RUN}")
     except Exception as e:
@@ -797,6 +926,22 @@ def funding_arbitrage_signals():
                 print(f"[FUND ARB CLOSE] reason={close_reason}, short={short_key}, long={long_key}, amt={amount:.4f}")
                 create_order(short_ex, symbol, "buy", amount)
                 create_order(long_ex,  symbol, "sell", amount)
+
+                # 로그 (청산)
+                log_trade(
+                    layer="FUNDING_ARB",
+                    symbol=symbol,
+                    venue=f"{short_key}_{long_key}",
+                    side="CLOSE",
+                    tier="NONE",
+                    prem_pct=spread * 100,
+                    notional_krw=None,
+                    amount=amount,
+                    gross_pnl_krw=None,
+                    fee_krw=None,
+                    net_pnl_krw=None,
+                )
+
                 msg = (
                     "[FUND ARB CLOSE]\n"
                     f"- short: {short_key}\n- long : {long_key}\n- amt  : {amount:.4f} BTC\n"
@@ -839,6 +984,22 @@ def funding_arbitrage_signals():
             "active": True, "short_ex":high_key, "long_ex":low_key,
             "symbol":symbol, "amount":amount, "open_spread":float(spread), "open_time":now
         })
+
+        # 로그 (오픈)
+        log_trade(
+            layer="FUNDING_ARB",
+            symbol=symbol,
+            venue=f"{high_key}_{low_key}",
+            side="OPEN",
+            tier="NONE",
+            prem_pct=spread * 100,
+            notional_krw=None,
+            amount=amount,
+            gross_pnl_krw=None,
+            fee_krw=None,
+            net_pnl_krw=None,
+        )
+
         msg = (
             "[FUND ARB OPEN]\n"
             f"- short: {high_key} (funding={rates[high_key]:.5f})\n"
@@ -874,12 +1035,13 @@ def main():
     global disable_trading
     load_state()
     init_exchanges()
+    init_trade_log()
     equity_krw = estimate_total_equity_krw()
     msg = (
-        f"극공격 김프봇 TEST 시작 (DRY_RUN={DRY_RUN})\n"
+        f"김프봇 안정형 성장 시작 (DRY_RUN={DRY_RUN})\n"
         f"- 추정 자본: 약 {int(equity_krw):,} KRW\n"
         f"- 일일 손실 한도: 자본의 {MAX_DAILY_LOSS_RATIO*100:.1f}% (동적)\n"
-        f"- 스프레드/비중/횟수 모두 공격형 세팅 (실계정 전환 전 충분히 테스트 필요)"
+        f"- 목표: 월 3~7% 수준의 안정적 성장 (무리한 HFT 지양)"
     )
     print(msg); send_telegram(msg)
 
