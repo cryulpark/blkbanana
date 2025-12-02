@@ -1,0 +1,920 @@
+import os, time, json, requests
+from datetime import datetime, timezone, date
+import ccxt
+from ccxt.base.errors import AuthenticationError
+
+###############################################################################
+# SETTINGS (극공격 테스트용: 월 수익 극대화 시도 / 리스크 ↑)
+###############################################################################
+
+# ⚠ 반드시 DRY_RUN 상태에서 충분히 테스트 후 실계정에 적용하세요.
+DRY_RUN = True
+MAIN_LOOP_INTERVAL = 20   # 더 공격적으로 자주 체크 (기존 60초 → 20초)
+
+# 동적 일일 손실 한도: "현재 자본의 10%" (공격형)
+MAX_DAILY_LOSS_RATIO = 0.10
+STATE_FILE = "kimchi_bot_state.json"
+
+# 레이어 ON/OFF
+ENABLE_LAYER_SPREAD_ARB   = True
+ENABLE_LAYER_KRW_CROSS    = True
+ENABLE_LAYER_FUNDING_SIG  = True
+ENABLE_LAYER_TRI_MONITOR  = True
+
+# 김프/역프 (극공격형)
+# - Tier1 문턱 낮춤: 0.6~1.0%
+# - Tier2: 0.3% 이상도 진입
+TIER1_THR_MIN = 0.6      # Tier1: 0.6~1.0% 김프
+TIER1_THR_MAX = 1.0
+TIER2_THR     = 0.3      # Tier2: 0.3% 이상
+
+# 자본 비율 (극공격형)
+# - 기본 진입 비중 60~90%
+# - Tier2도 50% 정도 비중
+BASE_RATIO_MIN = 0.6     # 한 번 진입에 60~90%
+BASE_RATIO_MAX = 0.9
+TIER2_RATIO_FACTOR = 0.5
+
+# 최소 노출/트레이드 제한 (극공격형)
+MIN_NOTIONAL_KRW = 30000   # 3만원 이상이면 진입 (기존 5만원)
+MAX_TRADES_1H = 120        # 시간당 최대 120트레이드까지 허용 (기존 40)
+
+# 업↔빗 KRW 차익 (극공격형)
+# - 스프레드 문턱 낮춤: 0.18 → 0.08
+# - 자본 사용 비율: 20% → 50%
+KRW_ARB_THR   = 0.08
+KRW_ARB_RATIO = 0.5
+
+# 펀딩 아비트 (극공격형)
+FUTURES_SYMBOL          = "BTC/USDT:USDT"
+FUNDING_SPREAD_THR_OPEN = 0.010   # 1.0% 이상 진입 (기존 1.5%)
+FUNDING_SPREAD_THR_CLOSE= 0.002   # 0.2% 이하 청산 (기존 0.4%)
+FUNDING_ARB_RATIO       = 0.20    # 각 선물계좌 20% 사용 (기존 10%)
+FUNDING_MIN_NOTIONAL_USDT = 50.0  # 최소 50 USDT (기존 100)
+FUNDING_TARGET_PAYMENTS = 3
+FUNDING_INTERVAL_HOURS  = 8.0
+FUNDING_MAX_HOURS_HOLD  = FUNDING_TARGET_PAYMENTS * FUNDING_INTERVAL_HOURS
+
+# 변동성 기준
+VOL_THRESHOLD_BORDER = 10.0
+
+# 프리미엄 예측 가중치
+PREMIUM_PRED_WEIGHTS = {
+    "upbit_speed": 0.3,
+    "bithumb_speed": 0.3,
+    "volatility": 0.2,
+    "orderbook_imbalance": 0.2,
+}
+
+# 수수료/슬리피지/최소 순엣지 (극공격형)
+# - 총 요구 gross edge를 0.40% → 0.25% 수준으로 완화
+FEE_RATES = {
+    "binance": 0.0004,
+    "upbit":   0.0005,
+    "bithumb": 0.0005,
+    "bybit":   0.0006,
+    "okx":     0.0005,
+}
+DEFAULT_FEE_RATE          = 0.0005
+EDGE_BUFFER_FEE_PCT       = 0.15   # 수수료 여유 버퍼
+EDGE_BUFFER_SLIPPAGE_PCT  = 0.05   # 슬리피지 버퍼
+EDGE_MIN_NET_PCT          = 0.05   # 최소 순엣지 0.05%
+
+###############################################################################
+# ENV
+###############################################################################
+
+def env(k: str) -> str:
+    if k not in os.environ:
+        raise Exception(f"[ENV] Missing: {k}")
+    return os.environ[k]
+
+BINANCE_API     = env("BINANCE_API_KEY")
+BINANCE_SECRET  = env("BINANCE_SECRET")
+UPBIT_API       = env("UPBIT_API_KEY")
+UPBIT_SECRET    = env("UPBIT_SECRET")
+BITHUMB_API     = env("BITHUMB_API_KEY")
+BITHUMB_SECRET  = env("BITHUMB_SECRET")
+BYBIT_API       = env("BYBIT_API_KEY")
+BYBIT_SECRET    = env("BYBIT_SECRET")
+OKX_API         = env("OKX_API_KEY")
+OKX_SECRET      = env("OKX_SECRET")
+OKX_PASSWORD    = env("OKX_PASSWORD")
+TELEGRAM_TOKEN  = env("TELEGRAM_TOKEN")
+CHAT_ID         = env("CHAT_ID")
+
+###############################################################################
+# GLOBAL STATE
+###############################################################################
+
+ex, ex_fut = {}, {}
+TRADE_TIMES = []
+price_history = {"upbit": [], "bithumb": []}
+disable_trading = False
+LAST_EQUITY_KRW = 21500000.0   # 초기 추정치 (≈ 2,150만 원)
+
+STATE = {
+    "date": None,  # "YYYY-MM-DD" UTC
+    "realized_pnl_krw": 0.0,
+    "realized_pnl_krw_daily": 0.0,
+    "realized_pnl_krw_weekly": 0.0,
+    "fees_krw": 0.0,
+    "fees_krw_daily": 0.0,
+    "fees_krw_weekly": 0.0,
+    "num_trades": 0,
+    "num_trades_daily": 0,
+    "num_trades_weekly": 0,
+    "weekly_start_date": None,
+}
+
+FUNDING_POS = {
+    "active": False,
+    "short_ex": None,
+    "long_ex":  None,
+    "symbol":   FUTURES_SYMBOL,
+    "amount":   0.0,
+    "open_spread": 0.0,
+    "open_time":   0.0,
+}
+
+###############################################################################
+# TELEGRAM / STATE
+###############################################################################
+
+def send_telegram(msg: str):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=5)
+    except Exception as e:
+        print(f"[TELEGRAM] ERR {e}")
+
+DEFAULT_STATE = STATE.copy()
+
+def save_state():
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(STATE, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[STATE] save ERR {e}")
+
+def load_state():
+    global STATE
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            STATE = DEFAULT_STATE.copy()
+            STATE.update(data)
+            print(f"[STATE] Loaded: {STATE}")
+        else:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            STATE["date"] = today
+            STATE["weekly_start_date"] = today
+            save_state()
+    except Exception as e:
+        print(f"[STATE] load ERR {e}")
+
+###############################################################################
+# FX / EQUITY
+###############################################################################
+
+def now_ts() -> float:
+    return time.time()
+
+def safe_ticker(e, symbol: str):
+    t = e.fetch_ticker(symbol)
+    bid = t.get("bid") or t.get("last")
+    ask = t.get("ask") or t.get("last")
+    if not bid or not ask:
+        raise Exception(f"invalid ticker {e.id} {symbol} {t}")
+    t["bid"], t["ask"] = bid, ask
+    return t
+
+def safe_orderbook(e, symbol: str, depth: int = 10):
+    try:
+        ob = e.fetch_order_book(symbol, depth)
+        if not ob["bids"] or not ob["asks"]:
+            raise Exception("empty ob")
+        return ob
+    except Exception as e2:
+        print(f"[OB] {e.id} {symbol} ERR {str(e2)[:80]}")
+        return None
+
+def get_usdt_krw() -> float:
+    for name in ["upbit", "bithumb"]:
+        inst = ex.get(name)
+        if not inst:
+            continue
+        try:
+            t = safe_ticker(inst, "USDT/KRW")
+            return float(t["bid"])
+        except Exception as e2:
+            print(f"[FX] {name} USDT/KRW ERR {e2}")
+    print("[FX] 환율 실패 → 1350 사용")
+    return 1350.0
+
+def estimate_total_equity_krw() -> float:
+    """현재 자산을 대략 KRW로 환산 (동적 손실 한도용)"""
+    global LAST_EQUITY_KRW
+    try:
+        usdt_krw = get_usdt_krw()
+        b = ex.get("binance")
+        if not b:
+            return LAST_EQUITY_KRW
+        t_btc = safe_ticker(b, "BTC/USDT")
+        t_eth = safe_ticker(b, "ETH/USDT")
+        btc_usdt = float(t_btc["last"])
+        eth_usdt = float(t_eth["last"])
+        total_krw = 0.0
+
+        # 업비트/빗썸: KRW, BTC, ETH
+        for name in ["upbit", "bithumb"]:
+            inst = ex.get(name)
+            if not inst:
+                continue
+            try:
+                bal = inst.fetch_balance()
+            except Exception as e:
+                print(f"[EQ] {name} balance ERR {e}")
+                continue
+            krw = float(bal.get("KRW", {}).get("total", 0) or 0)
+            btc = float(bal.get("BTC", {}).get("total", 0) or 0)
+            eth = float(bal.get("ETH", {}).get("total", 0) or 0)
+            total_krw += krw + btc * btc_usdt * usdt_krw + eth * eth_usdt * usdt_krw
+
+        # 바이낸스: USDT, BTC, ETH
+        inst = ex.get("binance")
+        if inst:
+            try:
+                bal = inst.fetch_balance()
+                usdt = float(bal.get("USDT", {}).get("total", 0) or 0)
+                btc  = float(bal.get("BTC", {}).get("total", 0) or 0)
+                eth  = float(bal.get("ETH", {}).get("total", 0) or 0)
+                total_krw += usdt * usdt_krw + btc * btc_usdt * usdt_krw + eth * eth_usdt * usdt_krw
+            except Exception as e:
+                print(f"[EQ] binance balance ERR {e}")
+
+        # OKX: USDT
+        inst = ex.get("okx")
+        if inst:
+            try:
+                bal = inst.fetch_balance()
+                usdt = float(bal.get("USDT", {}).get("total", 0) or 0)
+                total_krw += usdt * usdt_krw
+            except Exception as e:
+                print(f"[EQ] okx balance ERR {e}")
+
+        # Bybit: USDT + USD
+        inst = ex.get("bybit")
+        if inst:
+            try:
+                bal = inst.fetch_balance()
+                usdt = float(bal.get("USDT", {}).get("total", 0) or 0)
+                usd  = float(bal.get("USD",  {}).get("total", 0) or 0)
+                total_krw += (usdt + usd) * usdt_krw
+            except Exception as e:
+                print(f"[EQ] bybit balance ERR {e}")
+
+        if total_krw <= 0:
+            return LAST_EQUITY_KRW
+        LAST_EQUITY_KRW = total_krw
+        return total_krw
+    except Exception as e:
+        print(f"[EQ] estimate ERR {e}")
+        return LAST_EQUITY_KRW
+
+def get_daily_volatility() -> float:
+    try:
+        b = ex["binance"]
+        ohlcv = b.fetch_ohlcv("BTC/USDT", "1d", limit=2)
+        if len(ohlcv) < 2:
+            return 0.0
+        p0 = ohlcv[0][4]
+        p1 = ohlcv[1][4]
+        return abs((p1 - p0) / p0 * 100)
+    except Exception as e:
+        print(f"[VOL] ERR {e}")
+        return 0.0
+
+###############################################################################
+# PRICE SPEED / IMBALANCE
+###############################################################################
+
+def record_price(source: str, price: float):
+    ph = price_history[source]
+    ph.append(price)
+    if len(ph) > 50:
+        ph.pop(0)
+
+def price_speed(source: str) -> float:
+    ph = price_history[source]
+    if len(ph) < 3:
+        return 0.0
+    return (ph[-1] - ph[0]) / (abs(ph[0]) + 1e-9)
+
+def orderbook_imbalance(ob) -> float:
+    if not ob:
+        return 0.0
+    bid_vol = sum(v for p, v in ob["bids"])
+    ask_vol = sum(v for p, v in ob["asks"])
+    tot = bid_vol + ask_vol
+    if tot == 0:
+        return 0.0
+    return (bid_vol - ask_vol) / tot
+
+def predict_premium_prob(vol: float) -> float:
+    up_speed = price_speed("upbit")
+    bt_speed = price_speed("bithumb")
+    ob = safe_orderbook(ex["upbit"], "BTC/KRW", depth=5)
+    imbal = orderbook_imbalance(ob)
+    score = (
+        PREMIUM_PRED_WEIGHTS["upbit_speed"] * up_speed +
+        PREMIUM_PRED_WEIGHTS["bithumb_speed"] * bt_speed +
+        PREMIUM_PRED_WEIGHTS["volatility"] * (vol / 15.0) +
+        PREMIUM_PRED_WEIGHTS["orderbook_imbalance"] * imbal
+    )
+    return max(0.0, min(1.0, score))
+
+###############################################################################
+# VWAP / AUTO PARAMS
+###############################################################################
+
+def calc_vwap(ob, amount: float, is_buy: bool):
+    if not ob:
+        return None
+    side = ob["asks"] if is_buy else ob["bids"]
+    remain, cost = amount, 0.0
+    for price, vol in side:
+        use = min(vol, remain)
+        cost += price * use
+        remain -= use
+        if remain <= 0:
+            break
+    if remain > 0:
+        return None
+    return cost / amount
+
+def auto_tier1_params(vol: float, trade_times):
+    tc = len([t for t in trade_times if now_ts() - t <= 3600])
+    v = min(max(vol, 0.0), VOL_THRESHOLD_BORDER)
+    thr = TIER1_THR_MAX if VOL_THRESHOLD_BORDER <= 0 else TIER1_THR_MIN + (TIER1_THR_MAX - TIER1_THR_MIN) * (v / VOL_THRESHOLD_BORDER)
+    prob = predict_premium_prob(vol)
+    thr -= prob * 0.3
+    if tc > MAX_TRADES_1H * 0.7:
+        thr += 0.3
+    thr = max(0.4, min(2.0, thr))  # 극공격: 하한 0.4%까지 허용
+
+    base_ratio = 0.7  # 기본값을 약간 높게
+    vol_factor = v / VOL_THRESHOLD_BORDER if VOL_THRESHOLD_BORDER > 0 else 1.0
+    base_ratio -= vol_factor * 0.1
+    base_ratio += prob * 0.1
+    base_ratio = max(BASE_RATIO_MIN, min(BASE_RATIO_MAX, base_ratio))
+    return thr, base_ratio
+
+###############################################################################
+# CORE HELPERS / PnL
+###############################################################################
+
+def create_order(inst, symbol, side, amount):
+    print(f"[ORDER] {inst.id} {side.upper()} {symbol} {amount} DRY_RUN={DRY_RUN}")
+    if DRY_RUN:
+        return
+    if side.lower() == "buy":
+        inst.create_market_buy_order(symbol, amount)
+    else:
+        inst.create_market_sell_order(symbol, amount)
+
+def can_trade_more(trade_times):
+    now = now_ts()
+    recent = [t for t in trade_times if now - t <= 3600]
+    return len(recent) < MAX_TRADES_1H
+
+def estimate_fee_krw(exchange_id: str, notional_krw: float) -> float:
+    rate = FEE_RATES.get(exchange_id, DEFAULT_FEE_RATE)
+    return notional_krw * rate
+
+def send_daily_report(prev_date: str, pnl: float, trades: int, fees: float):
+    msg = (
+        f"[DAILY REPORT {prev_date}]\n"
+        f"- 실현손익: {int(pnl)} KRW\n"
+        f"- 트레이드 수: {trades} 건\n"
+        f"- 수수료: {int(fees)} KRW\n"
+        f"- 누적 손익: {int(STATE['realized_pnl_krw'])} KRW"
+    )
+    print(msg)
+    send_telegram(msg)
+
+def send_weekly_report(start_date: str, end_date: str, pnl: float, trades: int, fees: float):
+    msg = (
+        f"[WEEKLY REPORT {start_date} ~ {end_date}]\n"
+        f"- 실현손익: {int(pnl)} KRW\n"
+        f"- 트레이드 수: {trades} 건\n"
+        f"- 수수료: {int(fees)} KRW\n"
+        f"- 누적 손익: {int(STATE['realized_pnl_krw'])} KRW"
+    )
+    print(msg)
+    send_telegram(msg)
+
+def rollover_daily_pnl():
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    prev_date = STATE["date"]
+    if prev_date is None:
+        STATE["date"] = today_str
+        if STATE["weekly_start_date"] is None:
+            STATE["weekly_start_date"] = today_str
+        save_state()
+        return
+    if prev_date == today_str:
+        return
+
+    # 데일리 리포트
+    prev_pnl   = STATE["realized_pnl_krw_daily"]
+    prev_tr    = STATE["num_trades_daily"]
+    prev_fees  = STATE["fees_krw_daily"]
+    send_daily_report(prev_date, prev_pnl, prev_tr, prev_fees)
+
+    STATE["realized_pnl_krw_daily"] = 0.0
+    STATE["fees_krw_daily"] = 0.0
+    STATE["num_trades_daily"] = 0
+
+    # 주간 리포트
+    if STATE["weekly_start_date"] is None:
+        STATE["weekly_start_date"] = prev_date
+
+    try:
+        ws = date.fromisoformat(STATE["weekly_start_date"])
+        pe = date.fromisoformat(prev_date)
+        days_diff = (pe - ws).days
+    except Exception:
+        days_diff = 0
+
+    if days_diff >= 6:
+        weekly_pnl  = STATE["realized_pnl_krw_weekly"]
+        weekly_tr   = STATE["num_trades_weekly"]
+        weekly_fees = STATE["fees_krw_weekly"]
+        send_weekly_report(STATE["weekly_start_date"], prev_date, weekly_pnl, weekly_tr, weekly_fees)
+        STATE["realized_pnl_krw_weekly"] = 0.0
+        STATE["fees_krw_weekly"] = 0.0
+        STATE["num_trades_weekly"] = 0
+        STATE["weekly_start_date"] = today_str
+
+    STATE["date"] = today_str
+    save_state()
+
+def update_pnl(trade_name: str, pnl_krw: float, fee_krw: float):
+    """PnL/수수료/트레이드 누적 + 일/주간 업데이트 + 동적 10% 손실 한도 체크"""
+    global disable_trading
+    STATE["realized_pnl_krw"]        += pnl_krw
+    STATE["realized_pnl_krw_daily"]  += pnl_krw
+    STATE["realized_pnl_krw_weekly"] += pnl_krw
+    STATE["fees_krw"]        += fee_krw
+    STATE["fees_krw_daily"]  += fee_krw
+    STATE["fees_krw_weekly"] += fee_krw
+    STATE["num_trades"]      += 1
+    STATE["num_trades_daily"]+= 1
+    STATE["num_trades_weekly"]+=1
+    save_state()
+
+    print(
+        f"[PNL] {trade_name} pnl={pnl_krw:.0f} fee={fee_krw:.0f} "
+        f"day_pnl={STATE['realized_pnl_krw_daily']:.0f} "
+        f"week_pnl={STATE['realized_pnl_krw_weekly']:.0f} "
+        f"total={STATE['realized_pnl_krw']:.0f}"
+    )
+
+    equity_krw = estimate_total_equity_krw()
+    loss_limit = equity_krw * MAX_DAILY_LOSS_RATIO
+    if STATE["realized_pnl_krw_daily"] <= -loss_limit and not disable_trading:
+        disable_trading = True
+        msg = (
+            f"[RISK] 일일 손실 한도 초과(극공격 모드): PnL={STATE['realized_pnl_krw_daily']:.0f} krw "
+            f"<= -{int(loss_limit)} (자본 {int(equity_krw)}의 {MAX_DAILY_LOSS_RATIO*100:.1f}%)\n"
+            f"→ 자동 매매 중단."
+        )
+        print(msg)
+        send_telegram(msg)
+
+###############################################################################
+# EXCHANGE INIT
+###############################################################################
+
+def init_exchanges():
+    global ex, ex_fut
+    ex, ex_fut = {}, {}
+
+    spot_cfg = [
+        ("binance", ccxt.binance,   BINANCE_API,   BINANCE_SECRET, None),
+        ("upbit",   ccxt.upbit,     UPBIT_API,     UPBIT_SECRET,   None),
+        ("bithumb", ccxt.bithumb,   BITHUMB_API,   BITHUMB_SECRET, None),
+        ("bybit",   ccxt.bybit,     BYBIT_API,     BYBIT_SECRET,   None),
+        ("okx",     ccxt.okx,       OKX_API,       OKX_SECRET,     OKX_PASSWORD),
+    ]
+    for name, cls, key, sec, pwd in spot_cfg:
+        try:
+            params = {"apiKey": key, "secret": sec, "enableRateLimit": True}
+            if name == "okx":
+                params["password"] = pwd
+            inst = cls(params)
+            inst.load_markets()
+            ex[name] = inst
+            print(f"[INIT] {name} spot 연결 성공")
+        except Exception as e:
+            print(f"[INIT] {name} spot ERR {e}")
+
+    try:
+        bin_fut = ccxt.binanceusdm({
+            "apiKey": BINANCE_API, "secret": BINANCE_SECRET, "enableRateLimit": True,
+        })
+        bin_fut.load_markets()
+        ex_fut["binance_fut"] = bin_fut
+        print("[INIT] binance_fut 연결 성공")
+    except Exception as e:
+        print(f"[INIT] binance_fut ERR {e}")
+
+    try:
+        bybit_fut = ccxt.bybit({
+            "apiKey": BYBIT_API, "secret": BYBIT_SECRET, "enableRateLimit": True,
+            "options": {"defaultType": "swap"},
+        })
+        bybit_fut.load_markets()
+        ex_fut["bybit_fut"] = bybit_fut
+        print("[INIT] bybit_fut 연결 성공")
+    except Exception as e:
+        print(f"[INIT] bybit_fut ERR {e}")
+
+    try:
+        okx_fut = ccxt.okx({
+            "apiKey": OKX_API, "secret": OKX_SECRET, "password": OKX_PASSWORD,
+            "enableRateLimit": True, "options": {"defaultType": "swap"},
+        })
+        okx_fut.load_markets()
+        ex_fut["okx_fut"] = okx_fut
+        print("[INIT] okx_fut 연결 성공")
+    except Exception as e:
+        print(f"[INIT] okx_fut ERR {e}")
+
+###############################################################################
+# ARB LAYERS
+###############################################################################
+
+def run_spread_arbitrage(symbol: str, tier1_thr: float, base_ratio: float, trade_times):
+    global disable_trading
+    if disable_trading or not ENABLE_LAYER_SPREAD_ARB:
+        print(f"[ARB] skip {symbol}")
+        return
+    try:
+        b = ex["binance"]
+        usdt_krw = get_usdt_krw()
+        base_pair = f"{symbol}/USDT"
+        t_base = safe_ticker(b, base_pair)
+        base_usdt = float(t_base["bid"])
+        ref_krw = base_usdt * usdt_krw
+        bal_b = b.fetch_balance()
+        free_usdt = float(bal_b.get("USDT", {}).get("free", 0) or 0)
+        free_sym  = float(bal_b.get(symbol, {}).get("free", 0) or 0)
+
+        for venue in ["upbit", "bithumb"]:
+            e = ex[venue]
+            try:
+                t_krw = safe_ticker(e, f"{symbol}/KRW")
+                last_price = t_krw["last"]; record_price(venue, last_price)
+            except Exception as e2:
+                print(f"[ARB] {venue} ticker ERR {e2}"); continue
+
+            test_amount = 0.01 if symbol=="BTC" else 0.05
+            ob = safe_orderbook(e, f"{symbol}/KRW", depth=10)
+            vwap_sell_krw = calc_vwap(ob, test_amount, is_buy=False)
+            vwap_buy_krw  = calc_vwap(ob, test_amount, is_buy=True)
+
+            if vwap_sell_krw:
+                sell_usdt = vwap_sell_krw / usdt_krw
+                sell_prem = (sell_usdt/base_usdt -1)*100
+            else:
+                sell_prem = None
+            if vwap_buy_krw:
+                buy_usdt = vwap_buy_krw / usdt_krw
+                buy_prem = (buy_usdt/base_usdt -1)*100
+            else:
+                buy_prem = None
+
+            print(f"[REAL {symbol} {venue}] sell={sell_prem} buy={buy_prem} thr={tier1_thr:.2f} base_ratio={base_ratio:.2f}")
+
+            try:
+                bal_k = e.fetch_balance()
+            except AuthenticationError as ae:
+                print(f"[ARB] {venue} balance auth ERR {ae}"); continue
+            except Exception as e3:
+                print(f"[ARB] {venue} balance ERR {e3}"); continue
+
+            ex_krw = float(bal_k.get("KRW",{}).get("free",0) or 0)
+            ex_sym = float(bal_k.get(symbol,{}).get("free",0) or 0)
+
+            def net_edge_ok(prem: float) -> bool:
+                if prem is None: return False
+                gross = abs(prem)
+                needed = EDGE_BUFFER_FEE_PCT + EDGE_BUFFER_SLIPPAGE_PCT + EDGE_MIN_NET_PCT
+                return gross >= needed
+
+            # 김프: 국내 SELL / 바이낸스 BUY
+            if sell_prem is not None and can_trade_more(trade_times) and net_edge_ok(sell_prem):
+                trade_tier, trade_ratio = None, 0.0
+                if sell_prem >= tier1_thr:
+                    trade_tier, trade_ratio = "TIER1", base_ratio
+                elif sell_prem >= TIER2_THR:
+                    trade_tier, trade_ratio = "TIER2", base_ratio*TIER2_RATIO_FACTOR
+
+                if trade_tier and ex_sym>0 and free_usdt>0:
+                    max_from_k = ex_sym * trade_ratio
+                    max_from_b = (free_usdt*trade_ratio)/base_usdt
+                    amt = min(max_from_k,max_from_b)
+                    vwap = vwap_sell_krw or t_krw["bid"]
+                    notional_krw_sell = amt * vwap
+                    notional_krw_buy  = amt * ref_krw
+                    notional_krw      = min(notional_krw_sell, notional_krw_buy)
+                    if notional_krw >= MIN_NOTIONAL_KRW:
+                        fee_sell = estimate_fee_krw(venue, notional_krw_sell)
+                        fee_buy  = estimate_fee_krw("binance", notional_krw_buy)
+                        gross_pnl = (vwap - ref_krw) * amt
+                        total_fee = fee_sell + fee_buy
+                        net_pnl   = gross_pnl - total_fee
+                        print(f"[ARB {symbol}] {venue} SELL {trade_tier} amt={amt} notional={int(notional_krw)} net_pnl={net_pnl:.0f}")
+                        create_order(b,base_pair,"buy",amt)
+                        create_order(e,f"{symbol}/KRW","sell",amt)
+                        trade_times.append(now_ts())
+                        update_pnl(f"{symbol}-{venue}-SELL-{trade_tier}", net_pnl, total_fee)
+                        send_telegram(f"[{symbol}] {venue} SELL {trade_tier} prem={sell_prem:.2f}% amt={amt:.6f} net_pnl={int(net_pnl)} DRY_RUN={DRY_RUN}")
+
+            # 역프: 국내 BUY / 바이낸스 SELL
+            if buy_prem is not None and can_trade_more(trade_times) and net_edge_ok(buy_prem):
+                trade_tier, trade_ratio = None, 0.0
+                if buy_prem <= -tier1_thr:
+                    trade_tier, trade_ratio = "TIER1", base_ratio
+                elif buy_prem <= -TIER2_THR:
+                    trade_tier, trade_ratio = "TIER2", base_ratio*TIER2_RATIO_FACTOR
+
+                if trade_tier and ex_krw>0 and free_sym>0:
+                    vwap = vwap_buy_krw or t_krw["ask"]
+                    max_from_krw = (ex_krw*trade_ratio)/vwap
+                    max_from_sym = free_sym*trade_ratio
+                    amt = min(max_from_krw,max_from_sym)
+                    notional_krw_buy  = amt*vwap
+                    notional_krw_sell = amt*ref_krw
+                    notional_krw      = min(notional_krw_buy,notional_krw_sell)
+                    if notional_krw >= MIN_NOTIONAL_KRW:
+                        fee_buy  = estimate_fee_krw(venue, notional_krw_buy)
+                        fee_sell = estimate_fee_krw("binance", notional_krw_sell)
+                        gross_pnl = (ref_krw - vwap)*amt
+                        total_fee = fee_buy + fee_sell
+                        net_pnl   = gross_pnl - total_fee
+                        print(f"[ARB {symbol}] {venue} BUY {trade_tier} amt={amt} notional={int(notional_krw)} net_pnl={net_pnl:.0f}")
+                        create_order(e,f"{symbol}/KRW","buy",amt)
+                        create_order(b,base_pair,"sell",amt)
+                        trade_times.append(now_ts())
+                        update_pnl(f"{symbol}-{venue}-BUY-{trade_tier}", net_pnl, total_fee)
+                        send_telegram(f"[{symbol}] {venue} BUY {trade_tier} prem={buy_prem:.2f}% amt={amt:.6f} net_pnl={int(net_pnl)} DRY_RUN={DRY_RUN}")
+    except Exception as e:
+        print(f"[ARB ERR] {symbol} {e}")
+        send_telegram(f"[ARB ERR] {symbol}: {e}")
+
+def run_krw_cross_arb(symbol: str):
+    if disable_trading or not ENABLE_LAYER_KRW_CROSS:
+        print(f"[KRW-ARB] skip {symbol}"); return
+    try:
+        u, b = ex["upbit"], ex["bithumb"]
+        t_u, t_b = safe_ticker(u,f"{symbol}/KRW"), safe_ticker(b,f"{symbol}/KRW")
+        price_u, price_b = float(t_u["last"]), float(t_b["last"])
+        diff, mid = price_u - price_b, (price_u + price_b)/2
+        prem = (diff/mid)*100
+        print(f"[KRW-ARB {symbol}] up={price_u} bt={price_b} prem={prem:.3f}%")
+        if abs(prem) < KRW_ARB_THR: return
+        gross = abs(prem)
+        needed = EDGE_BUFFER_FEE_PCT + EDGE_BUFFER_SLIPPAGE_PCT + EDGE_MIN_NET_PCT
+        if gross < needed:
+            print(f"[KRW-ARB {symbol}] prem={prem:.3f}% but net edge 부족(need {needed:.2f}%)")
+            return
+
+        bal_u, bal_b = u.fetch_balance(), b.fetch_balance()
+        free_u_sym = float(bal_u.get(symbol,{}).get("free",0) or 0)
+        free_b_sym = float(bal_b.get(symbol,{}).get("free",0) or 0)
+        free_u_krw = float(bal_u.get("KRW",{}).get("free",0) or 0)
+        free_b_krw = float(bal_b.get("KRW",{}).get("free",0) or 0)
+        max_notional = KRW_ARB_RATIO * min(
+            free_u_sym*price_u + free_u_krw,
+            free_b_sym*price_b + free_b_krw
+        )
+        if max_notional < MIN_NOTIONAL_KRW: return
+
+        if prem > 0:
+            amt = max_notional / price_u
+            amt = min(amt, free_u_sym*0.9, (free_b_krw*0.9)/price_b)
+            if amt <= 0: return
+            notional_sell = amt*price_u
+            notional_buy  = amt*price_b
+            fee_sell = estimate_fee_krw("upbit", notional_sell)
+            fee_buy  = estimate_fee_krw("bithumb", notional_buy)
+            gross_pnl = (price_u - price_b)*amt
+            total_fee = fee_sell + fee_buy
+            net_pnl   = gross_pnl - total_fee
+            print(f"[KRW-ARB {symbol}] upbit SELL, bithumb BUY amt={amt} net_pnl={net_pnl:.0f}")
+            create_order(u,f"{symbol}/KRW","sell",amt)
+            create_order(b,f"{symbol}/KRW","buy",amt)
+            update_pnl(f"{symbol}-KRW-ARB-up-sell", net_pnl, total_fee)
+            send_telegram(f"[KRW ARB {symbol}] upbit SELL / bithumb BUY prem={prem:.3f}% amt={amt:.5f} net_pnl={int(net_pnl)} DRY_RUN={DRY_RUN}")
+        else:
+            amt = max_notional / price_b
+            amt = min(amt, free_b_sym*0.9, (free_u_krw*0.9)/price_u)
+            if amt <= 0: return
+            notional_sell = amt*price_b
+            notional_buy  = amt*price_u
+            fee_sell = estimate_fee_krw("bithumb", notional_sell)
+            fee_buy  = estimate_fee_krw("upbit", notional_buy)
+            gross_pnl = (price_b - price_u)*amt
+            total_fee = fee_sell + fee_buy
+            net_pnl   = gross_pnl - total_fee
+            print(f"[KRW-ARB {symbol}] bithumb SELL, upbit BUY amt={amt} net_pnl={net_pnl:.0f}")
+            create_order(b,f"{symbol}/KRW","sell",amt)
+            create_order(u,f"{symbol}/KRW","buy",amt)
+            update_pnl(f"{symbol}-KRW-ARB-bt-sell", net_pnl, total_fee)
+            send_telegram(f"[KRW ARB {symbol}] bithumb SELL / upbit BUY prem={prem:.3f}% amt={amt:.5f} net_pnl={int(net_pnl)} DRY_RUN={DRY_RUN}")
+    except Exception as e:
+        print(f"[KRW-ARB ERR {symbol}] {e}")
+
+def funding_arbitrage_signals():
+    if not ENABLE_LAYER_FUNDING_SIG: return
+    global FUNDING_POS
+    try:
+        if not ex_fut:
+            print("[FUND] futures exchanges not initialized"); return
+
+        rates = {}
+        try:
+            bin_fut = ex_fut.get("binance_fut")
+            if bin_fut:
+                fr = bin_fut.fetch_funding_rate(FUTURES_SYMBOL)
+                rates["binance_fut"] = fr["fundingRate"]
+        except Exception as e:
+            print(f"[FUND] binance_fut ERR {e}")
+        try:
+            bybit_fut = ex_fut.get("bybit_fut")
+            if bybit_fut:
+                fr = bybit_fut.fetch_funding_rate(FUTURES_SYMBOL)
+                rates["bybit_fut"] = fr["fundingRate"]
+        except Exception as e:
+            print(f"[FUND] bybit_fut ERR {e}")
+        try:
+            okx_fut = ex_fut.get("okx_fut")
+            if okx_fut:
+                fr = okx_fut.fetch_funding_rate(FUTURES_SYMBOL)
+                rates["okx_fut"] = fr["fundingRate"]
+        except Exception as e:
+            print(f"[FUND] okx_fut ERR {e}")
+
+        print(f"[FUND RATES] {rates}")
+        if len(rates) < 2: return
+
+        max_ex = max(rates, key=rates.get)
+        min_ex = min(rates, key=rates.get)
+        spread = rates[max_ex] - rates[min_ex]
+        print(f"[FUND SPREAD] max={max_ex}({rates[max_ex]:.5f}) min={min_ex}({rates[min_ex]:.5f}) diff={spread:.5f}")
+
+        now = now_ts()
+
+        # 기존 포지션 청산
+        if FUNDING_POS["active"]:
+            hold_hours = (now - FUNDING_POS["open_time"]) / 3600.0
+            close_reason = None
+            if hold_hours >= FUNDING_MAX_HOURS_HOLD:
+                close_reason = f"TIME: {hold_hours:.2f}h >= {FUNDING_MAX_HOURS_HOLD:.2f}h"
+            elif spread <= FUNDING_SPREAD_THR_CLOSE:
+                close_reason = f"SPREAD: {spread:.5f} <= {FUNDING_SPREAD_THR_CLOSE}"
+
+            if close_reason:
+                short_key, long_key = FUNDING_POS["short_ex"], FUNDING_POS["long_ex"]
+                symbol, amount = FUNDING_POS["symbol"], FUNDING_POS["amount"]
+                short_ex, long_ex = ex_fut.get(short_key), ex_fut.get(long_key)
+                if not short_ex or not long_ex:
+                    print("[FUND CLOSE] missing fut instance"); return
+                print(f"[FUND ARB CLOSE] reason={close_reason}, short={short_key}, long={long_key}, amt={amount:.4f}")
+                create_order(short_ex, symbol, "buy", amount)
+                create_order(long_ex,  symbol, "sell", amount)
+                msg = (
+                    "[FUND ARB CLOSE]\n"
+                    f"- short: {short_key}\n- long : {long_key}\n- amt  : {amount:.4f} BTC\n"
+                    f"- reason: {close_reason}\n- open_spread={FUNDING_POS['open_spread']:.5f}\n"
+                    f"- current_spread={spread:.5f}\n- hold_hours={hold_hours:.2f}\n- DRY_RUN={DRY_RUN}"
+                )
+                print(msg); send_telegram(msg)
+                FUNDING_POS.update({"active": False, "short_ex":None, "long_ex":None,
+                                    "amount":0.0, "open_spread":0.0, "open_time":0.0})
+            return
+
+        # 새 포지션 진입
+        if disable_trading:
+            print("[FUND] trading disabled, skip open"); return
+        if spread < FUNDING_SPREAD_THR_OPEN: return
+
+        high_key, low_key = max_ex, min_ex
+        high_ex, low_ex = ex_fut.get(high_key), ex_fut.get(low_key)
+        if not high_ex or not low_ex:
+            print("[FUND] missing fut instance for open"); return
+        symbol = FUTURES_SYMBOL
+        t_high, t_low = safe_ticker(high_ex, symbol), safe_ticker(low_ex, symbol)
+        price_high = float(t_high["last"] or t_high["bid"])
+        price_low  = float(t_low["last"] or t_low["bid"])
+        mid_price  = (price_high + price_low)/2.0
+
+        bal_high, bal_low = high_ex.fetch_balance(), low_ex.fetch_balance()
+        free_high_usdt = float(bal_high.get("USDT",{}).get("free",0) or 0)
+        free_low_usdt  = float(bal_low.get("USDT",{}).get("free",0) or 0)
+        max_usable_usdt = min(free_high_usdt,free_low_usdt)*FUNDING_ARB_RATIO
+        if max_usable_usdt < FUNDING_MIN_NOTIONAL_USDT:
+            print(f"[FUND] not enough USDT: {max_usable_usdt:.1f}"); return
+
+        amount = max_usable_usdt/mid_price
+        if amount <= 0: return
+        print(f"[FUND ARB OPEN] short {high_key}, long {low_key}, amt={amount:.4f}, notional≈{max_usable_usdt:.1f}, spread={spread:.5f}")
+        create_order(high_ex, symbol, "sell", amount)
+        create_order(low_ex,  symbol, "buy",  amount)
+        FUNDING_POS.update({
+            "active": True, "short_ex":high_key, "long_ex":low_key,
+            "symbol":symbol, "amount":amount, "open_spread":float(spread), "open_time":now
+        })
+        msg = (
+            "[FUND ARB OPEN]\n"
+            f"- short: {high_key} (funding={rates[high_key]:.5f})\n"
+            f"- long : {low_key} (funding={rates[low_key]:.5f})\n"
+            f"- spread={spread:.5f} >= {FUNDING_SPREAD_THR_OPEN}\n"
+            f"- amt={amount:.4f} BTC, notional≈{max_usable_usdt:.1f} USDT\n"
+            f"- hold_target={FUNDING_TARGET_PAYMENTS} payments (≈ {FUNDING_MAX_HOURS_HOLD:.1f}h)\n"
+            f"- DRY_RUN={DRY_RUN}"
+        )
+        print(msg); send_telegram(msg)
+    except Exception as e:
+        print(f"[FUND ARB ERR] {e}")
+        send_telegram(f"[FUND ARB ERR] {e}")
+
+def triangular_monitor(name: str):
+    if not ENABLE_LAYER_TRI_MONITOR: return
+    try:
+        inst = ex.get(name)
+        if not inst: return
+        t1 = safe_ticker(inst,"BTC/USDT")
+        t2 = safe_ticker(inst,"ETH/USDT")
+        t3 = safe_ticker(inst,"ETH/BTC")
+        spread = (t2["bid"]/(t1["bid"]*t3["bid"]) -1)*100
+        print(f"[TRI {name}] {spread:.3f}%")
+    except Exception as e:
+        print(f"[TRI ERR {name}] {e}")
+
+###############################################################################
+# MAIN
+###############################################################################
+
+def main():
+    global disable_trading
+    load_state()
+    init_exchanges()
+    equity_krw = estimate_total_equity_krw()
+    msg = (
+        f"극공격 김프봇 TEST 시작 (DRY_RUN={DRY_RUN})\n"
+        f"- 추정 자본: 약 {int(equity_krw):,} KRW\n"
+        f"- 일일 손실 한도: 자본의 {MAX_DAILY_LOSS_RATIO*100:.1f}% (동적)\n"
+        f"- 스프레드/비중/횟수 모두 공격형 세팅 (실계정 전환 전 충분히 테스트 필요)"
+    )
+    print(msg); send_telegram(msg)
+
+    trade_times = []
+
+    while True:
+        loop_start = now_ts()
+        try:
+            rollover_daily_pnl()
+            vol = get_daily_volatility()
+            tier1_thr, base_ratio = auto_tier1_params(vol, trade_times)
+            trades_1h = len([t for t in trade_times if now_ts()-t<=3600])
+            print(f"\n[LOOP] vol={vol:.2f}% tier1_thr={tier1_thr:.2f}% base_ratio={base_ratio:.2f} trades_1h={trades_1h} day_pnl={STATE['realized_pnl_krw_daily']:.0f}")
+
+            if not disable_trading:
+                if ENABLE_LAYER_SPREAD_ARB:
+                    run_spread_arbitrage("BTC", tier1_thr, base_ratio, trade_times)
+                    run_spread_arbitrage("ETH", tier1_thr, base_ratio, trade_times)
+                if ENABLE_LAYER_KRW_CROSS:
+                    run_krw_cross_arb("BTC")
+                    run_krw_cross_arb("ETH")
+                if ENABLE_LAYER_FUNDING_SIG:
+                    funding_arbitrage_signals()
+                if ENABLE_LAYER_TRI_MONITOR:
+                    for name in ["bybit","okx"]:
+                        triangular_monitor(name)
+            else:
+                print("[LOOP] trading disabled – 매매 중단 상태")
+        except Exception as e:
+            print(f"[MAIN ERR] {e}")
+            send_telegram(f"[MAIN ERR] {e}")
+        elapsed = now_ts() - loop_start
+        sleep_time = max(5, MAIN_LOOP_INTERVAL - elapsed)
+        print(f"[LOOP] sleep {sleep_time:.1f}s")
+        time.sleep(sleep_time)
+
+if __name__ == "__main__":
+    main()
