@@ -4,14 +4,15 @@ import ccxt
 from ccxt.base.errors import AuthenticationError
 
 ###############################################################################
-# SETTINGS (성장형: 월 5% 목표)
+# SETTINGS (극공격 테스트용: 월 수익 극대화 시도 / 리스크 ↑)
 ###############################################################################
 
+# ⚠ 반드시 DRY_RUN 상태에서 충분히 테스트 후 실계정에 적용하세요.
 DRY_RUN = True
-MAIN_LOOP_INTERVAL = 60
+MAIN_LOOP_INTERVAL = 20   # 더 공격적으로 자주 체크 (기존 60초 → 20초)
 
-# 동적 일일 손실 한도: "현재 자본의 2%"
-MAX_DAILY_LOSS_RATIO = 0.02
+# 동적 일일 손실 한도: "현재 자본의 10%" (공격형)
+MAX_DAILY_LOSS_RATIO = 0.10
 STATE_FILE = "kimchi_bot_state.json"
 
 # 레이어 ON/OFF
@@ -20,35 +21,44 @@ ENABLE_LAYER_KRW_CROSS    = True
 ENABLE_LAYER_FUNDING_SIG  = True
 ENABLE_LAYER_TRI_MONITOR  = True
 
-# 김프/역프 (성장형)
-TIER1_THR_MIN = 1.0      # Tier1: 1.0~1.4% 김프
-TIER1_THR_MAX = 1.4
-TIER2_THR     = 0.5      # Tier2: 0.5% 이상
+# 김프/역프 (극공격형)
+# - Tier1 문턱 낮춤: 0.6~1.0%
+# - Tier2: 0.3% 이상도 진입
+TIER1_THR_MIN = 0.6      # Tier1: 0.6~1.0% 김프
+TIER1_THR_MAX = 1.0
+TIER2_THR     = 0.3      # Tier2: 0.3% 이상
 
-# 자본 비율 (성장형)
-BASE_RATIO_MIN = 0.4     # 한 번 진입에 40~75%
-BASE_RATIO_MAX = 0.75
-TIER2_RATIO_FACTOR = 0.3
+# 자본 비율 (극공격형)
+# - 기본 진입 비중 60~90%
+# - Tier2도 50% 정도 비중
+BASE_RATIO_MIN = 0.6     # 한 번 진입에 60~90%
+BASE_RATIO_MAX = 0.9
+TIER2_RATIO_FACTOR = 0.5
 
-MIN_NOTIONAL_KRW = 50000
-MAX_TRADES_1H = 40
+# 최소 노출/트레이드 제한 (극공격형)
+MIN_NOTIONAL_KRW = 30000   # 3만원 이상이면 진입 (기존 5만원)
+MAX_TRADES_1H = 120        # 시간당 최대 120트레이드까지 허용 (기존 40)
 
-# 업↔빗 KRW 차익 (성장형)
-KRW_ARB_THR   = 0.18
-KRW_ARB_RATIO = 0.2
+# 업↔빗 KRW 차익 (극공격형)
+# - 스프레드 문턱 낮춤: 0.18 → 0.08
+# - 자본 사용 비율: 20% → 50%
+KRW_ARB_THR   = 0.08
+KRW_ARB_RATIO = 0.5
 
-# 펀딩 아비트 (성장형)
+# 펀딩 아비트 (극공격형)
 FUTURES_SYMBOL          = "BTC/USDT:USDT"
-FUNDING_SPREAD_THR_OPEN = 0.015   # 1.5% 이상 진입
-FUNDING_SPREAD_THR_CLOSE= 0.004   # 0.4% 이하 청산
-FUNDING_ARB_RATIO       = 0.10    # 각 선물계좌 10%
-FUNDING_MIN_NOTIONAL_USDT = 100.0
+FUNDING_SPREAD_THR_OPEN = 0.010   # 1.0% 이상 진입 (기존 1.5%)
+FUNDING_SPREAD_THR_CLOSE= 0.002   # 0.2% 이하 청산 (기존 0.4%)
+FUNDING_ARB_RATIO       = 0.20    # 각 선물계좌 20% 사용 (기존 10%)
+FUNDING_MIN_NOTIONAL_USDT = 50.0  # 최소 50 USDT (기존 100)
 FUNDING_TARGET_PAYMENTS = 3
 FUNDING_INTERVAL_HOURS  = 8.0
 FUNDING_MAX_HOURS_HOLD  = FUNDING_TARGET_PAYMENTS * FUNDING_INTERVAL_HOURS
 
+# 변동성 기준
 VOL_THRESHOLD_BORDER = 10.0
 
+# 프리미엄 예측 가중치
 PREMIUM_PRED_WEIGHTS = {
     "upbit_speed": 0.3,
     "bithumb_speed": 0.3,
@@ -56,7 +66,8 @@ PREMIUM_PRED_WEIGHTS = {
     "orderbook_imbalance": 0.2,
 }
 
-# 수수료/슬리피지/최소 순엣지 (성장형: net 0.10% 이상)
+# 수수료/슬리피지/최소 순엣지 (극공격형)
+# - 총 요구 gross edge를 0.40% → 0.25% 수준으로 완화
 FEE_RATES = {
     "binance": 0.0004,
     "upbit":   0.0005,
@@ -64,10 +75,10 @@ FEE_RATES = {
     "bybit":   0.0006,
     "okx":     0.0005,
 }
-DEFAULT_FEE_RATE     = 0.0005
-EDGE_BUFFER_FEE_PCT  = 0.20
-EDGE_BUFFER_SLIPPAGE_PCT = 0.10
-EDGE_MIN_NET_PCT     = 0.10
+DEFAULT_FEE_RATE          = 0.0005
+EDGE_BUFFER_FEE_PCT       = 0.15   # 수수료 여유 버퍼
+EDGE_BUFFER_SLIPPAGE_PCT  = 0.05   # 슬리피지 버퍼
+EDGE_MIN_NET_PCT          = 0.05   # 최소 순엣지 0.05%
 
 ###############################################################################
 # ENV
@@ -351,9 +362,9 @@ def auto_tier1_params(vol: float, trade_times):
     thr -= prob * 0.3
     if tc > MAX_TRADES_1H * 0.7:
         thr += 0.3
-    thr = max(1.0, min(2.0, thr))
+    thr = max(0.4, min(2.0, thr))  # 극공격: 하한 0.4%까지 허용
 
-    base_ratio = 0.5
+    base_ratio = 0.7  # 기본값을 약간 높게
     vol_factor = v / VOL_THRESHOLD_BORDER if VOL_THRESHOLD_BORDER > 0 else 1.0
     base_ratio -= vol_factor * 0.1
     base_ratio += prob * 0.1
@@ -451,7 +462,7 @@ def rollover_daily_pnl():
     save_state()
 
 def update_pnl(trade_name: str, pnl_krw: float, fee_krw: float):
-    """PnL/수수료/트레이드 누적 + 일/주간 업데이트 + 동적 2% 손실 한도 체크"""
+    """PnL/수수료/트레이드 누적 + 일/주간 업데이트 + 동적 10% 손실 한도 체크"""
     global disable_trading
     STATE["realized_pnl_krw"]        += pnl_krw
     STATE["realized_pnl_krw_daily"]  += pnl_krw
@@ -476,7 +487,7 @@ def update_pnl(trade_name: str, pnl_krw: float, fee_krw: float):
     if STATE["realized_pnl_krw_daily"] <= -loss_limit and not disable_trading:
         disable_trading = True
         msg = (
-            f"[RISK] 일일 손실 한도 초과: PnL={STATE['realized_pnl_krw_daily']:.0f} krw "
+            f"[RISK] 일일 손실 한도 초과(극공격 모드): PnL={STATE['realized_pnl_krw_daily']:.0f} krw "
             f"<= -{int(loss_limit)} (자본 {int(equity_krw)}의 {MAX_DAILY_LOSS_RATIO*100:.1f}%)\n"
             f"→ 자동 매매 중단."
         )
@@ -604,6 +615,7 @@ def run_spread_arbitrage(symbol: str, tier1_thr: float, base_ratio: float, trade
                 needed = EDGE_BUFFER_FEE_PCT + EDGE_BUFFER_SLIPPAGE_PCT + EDGE_MIN_NET_PCT
                 return gross >= needed
 
+            # 김프: 국내 SELL / 바이낸스 BUY
             if sell_prem is not None and can_trade_more(trade_times) and net_edge_ok(sell_prem):
                 trade_tier, trade_ratio = None, 0.0
                 if sell_prem >= tier1_thr:
@@ -632,6 +644,7 @@ def run_spread_arbitrage(symbol: str, tier1_thr: float, base_ratio: float, trade
                         update_pnl(f"{symbol}-{venue}-SELL-{trade_tier}", net_pnl, total_fee)
                         send_telegram(f"[{symbol}] {venue} SELL {trade_tier} prem={sell_prem:.2f}% amt={amt:.6f} net_pnl={int(net_pnl)} DRY_RUN={DRY_RUN}")
 
+            # 역프: 국내 BUY / 바이낸스 SELL
             if buy_prem is not None and can_trade_more(trade_times) and net_edge_ok(buy_prem):
                 trade_tier, trade_ratio = None, 0.0
                 if buy_prem <= -tier1_thr:
@@ -863,10 +876,10 @@ def main():
     init_exchanges()
     equity_krw = estimate_total_equity_krw()
     msg = (
-        f"공격형 김프봇 성장형 시작 (DRY_RUN={DRY_RUN})\n"
+        f"극공격 김프봇 TEST 시작 (DRY_RUN={DRY_RUN})\n"
         f"- 추정 자본: 약 {int(equity_krw):,} KRW\n"
         f"- 일일 손실 한도: 자본의 {MAX_DAILY_LOSS_RATIO*100:.1f}% (동적)\n"
-        f"- 월 5% 목표 성장형 세팅"
+        f"- 스프레드/비중/횟수 모두 공격형 세팅 (실계정 전환 전 충분히 테스트 필요)"
     )
     print(msg); send_telegram(msg)
 
