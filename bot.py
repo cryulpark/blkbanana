@@ -268,8 +268,9 @@ def get_usdt_krw() -> float:
             return float(t["bid"])
         except Exception as e2:
             print(f"[FX] {name} USDT/KRW ERR {e2}")
-    print("[FX] 환율 실패 → 1350 사용")
-    return 1350.0
+    # 여기가 너가 말한 fallback 기본값 변경 부분
+    print("[FX] 환율 실패 → 1450 사용")
+    return 1450.0
 
 def estimate_total_equity_krw() -> float:
     """현재 자산을 대략 KRW로 환산 (동적 손실 한도용)"""
@@ -944,9 +945,13 @@ def funding_arbitrage_signals():
 
                 msg = (
                     "[FUND ARB CLOSE]\n"
-                    f"- short: {short_key}\n- long : {long_key}\n- amt  : {amount:.4f} BTC\n"
-                    f"- reason: {close_reason}\n- open_spread={FUNDING_POS['open_spread']:.5f}\n"
-                    f"- current_spread={spread:.5f}\n- hold_hours={hold_hours:.2f}\n- DRY_RUN={DRY_RUN}"
+                    f"- short: {short_key}\n- long : {long_key}\n"
+                    f"- amt  : {amount:.4f} BTC\n"
+                    f"- reason: {close_reason}\n"
+                    f"- open_spread={FUNDING_POS['open_spread']:.5f}\n"
+                    f"- current_spread={spread:.5f}\n"
+                    f"- hold_hours={hold_hours:.2f}\n"
+                    f"- DRY_RUN={DRY_RUN}"
                 )
                 print(msg); send_telegram(msg)
                 FUNDING_POS.update({"active": False, "short_ex":None, "long_ex":None,
