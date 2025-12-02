@@ -4,53 +4,59 @@ import ccxt
 from ccxt.base.errors import AuthenticationError
 
 ###############################################################################
-# SETTINGS – 테스트용 극공격 모드 (DRY_RUN 전용)
+# SETTINGS (성장형: 월 5% 목표)
 ###############################################################################
 
-DRY_RUN = True                 # 반드시 True 유지 (실제 돈 쓰면 큰일남)
-MAIN_LOOP_INTERVAL = 60        # 1분 루프
+DRY_RUN = True
+MAIN_LOOP_INTERVAL = 60
 
-# ─ 김프/역프 레이어 (극공격) ─
-TIER1_THR_MIN = 0.5    # 굵은 김프 진입 기준(최소)
-TIER1_THR_MAX = 0.9    # 굵은 김프 진입 기준(최대)
-TIER2_THR     = 0.15   # 얕은 김프도 거의 다 들어가게
+# 동적 일일 손실 한도: "현재 자본의 2%"
+MAX_DAILY_LOSS_RATIO = 0.02
+STATE_FILE = "kimchi_bot_state.json"
 
-# 비중은 그대로 (DRY_RUN 이라 안전성 고려 X)
-BASE_RATIO_MIN = 0.4
+# 레이어 ON/OFF
+ENABLE_LAYER_SPREAD_ARB   = True
+ENABLE_LAYER_KRW_CROSS    = True
+ENABLE_LAYER_FUNDING_SIG  = True
+ENABLE_LAYER_TRI_MONITOR  = True
+
+# 김프/역프 (성장형)
+TIER1_THR_MIN = 1.0      # Tier1: 1.0~1.4% 김프
+TIER1_THR_MAX = 1.4
+TIER2_THR     = 0.5      # Tier2: 0.5% 이상
+
+# 자본 비율 (성장형)
+BASE_RATIO_MIN = 0.4     # 한 번 진입에 40~75%
 BASE_RATIO_MAX = 0.75
 TIER2_RATIO_FACTOR = 0.3
 
-# 최소 주문 규모
-MIN_NOTIONAL_KRW = 30000    # 원래 50,000 → 30,000
+MIN_NOTIONAL_KRW = 50000
+MAX_TRADES_1H = 40
 
-# 공격 테스트니까 1시간 최대 거래 수 크게 증가
-MAX_TRADES_1H = 80          # 원래 40
+# 업↔빗 KRW 차익 (성장형)
+KRW_ARB_THR   = 0.18
+KRW_ARB_RATIO = 0.2
 
-# ─ 업비트 ↔ 빗썸 KRW 차익 (극공격) ─
-KRW_ARB_THR   = 0.05        # 원래 0.18 → 0.05%
+# 펀딩 아비트 (성장형)
+FUTURES_SYMBOL          = "BTC/USDT:USDT"
+FUNDING_SPREAD_THR_OPEN = 0.015   # 1.5% 이상 진입
+FUNDING_SPREAD_THR_CLOSE= 0.004   # 0.4% 이하 청산
+FUNDING_ARB_RATIO       = 0.10    # 각 선물계좌 10%
+FUNDING_MIN_NOTIONAL_USDT = 100.0
+FUNDING_TARGET_PAYMENTS = 3
+FUNDING_INTERVAL_HOURS  = 8.0
+FUNDING_MAX_HOURS_HOLD  = FUNDING_TARGET_PAYMENTS * FUNDING_INTERVAL_HOURS
 
-# ─ 펀딩 아비트레이지(극공격) ─
-FUNDING_SPREAD_THR_OPEN  = 0.007   # 원래 0.015(1.5%) → 0.007(0.7%)
-FUNDING_SPREAD_THR_CLOSE = 0.003   # 살짝 완화
+VOL_THRESHOLD_BORDER = 10.0
 
-FUNDING_ARB_RATIO            = 0.10
-FUNDING_MIN_NOTIONAL_USDT    = 100.0
-FUNDING_TARGET_PAYMENTS      = 3
-FUNDING_INTERVAL_HOURS       = 8.0
-FUNDING_MAX_HOURS_HOLD       = FUNDING_TARGET_PAYMENTS * FUNDING_INTERVAL_HOURS
-
-# ─ 변동성 기준 ─
-VOL_THRESHOLD_BORDER = 10.0   
-
-# ─ 김프 예측 엔진 가중치 (기존 유지) ─
 PREMIUM_PRED_WEIGHTS = {
-    "upbit_speed":          0.3,
-    "bithumb_speed":        0.3,
-    "volatility":           0.2,
-    "orderbook_imbalance":  0.2,
+    "upbit_speed": 0.3,
+    "bithumb_speed": 0.3,
+    "volatility": 0.2,
+    "orderbook_imbalance": 0.2,
 }
 
-# ─ 수수료 / 슬리피지 / 최소 순엣지 (극공격) ─
+# 수수료/슬리피지/최소 순엣지 (성장형: net 0.10% 이상)
 FEE_RATES = {
     "binance": 0.0004,
     "upbit":   0.0005,
@@ -58,11 +64,10 @@ FEE_RATES = {
     "bybit":   0.0006,
     "okx":     0.0005,
 }
-DEFAULT_FEE_RATE = 0.0005
-
-EDGE_BUFFER_FEE_PCT       = 0.20   # 수수료 쿠션 (유지)
-EDGE_BUFFER_SLIPPAGE_PCT  = 0.10   # 슬리피지 쿠션 (유지)
-EDGE_MIN_NET_PCT          = 0.03   # 원래 0.10 → 0.03 (극공격)
+DEFAULT_FEE_RATE     = 0.0005
+EDGE_BUFFER_FEE_PCT  = 0.20
+EDGE_BUFFER_SLIPPAGE_PCT = 0.10
+EDGE_MIN_NET_PCT     = 0.10
 
 ###############################################################################
 # ENV
